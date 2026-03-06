@@ -16,3 +16,4 @@ notebooks/*.pyd
 output/
 models/
 .env
+*.pyc
