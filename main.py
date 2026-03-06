@@ -2,6 +2,7 @@ from fastapi import FastAPI,Depends
 from contextlib import asynccontextmanager
 from src.util.init_db import create_tables
 from src.routers.auth import authRouter
+from src.routers.company import companyRouter
 from src.util.middleware import get_current_user
 from src.db.schema.user import UserPublicResponse
 @asynccontextmanager
@@ -12,6 +13,7 @@ async def lifespan(app:FastAPI):
 
 app=FastAPI(lifespan=lifespan)
 app.include_router(router=authRouter,tags=["auth"],prefix="/auth")
+app.include_router(router=companyRouter,tags=["company"],prefix="/company")
 
 @app.get("/health")
 def health_check():

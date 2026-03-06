@@ -6,11 +6,6 @@ class UserCreate(BaseModel):
     last_name:str
     email:EmailStr
     password:str
-    is_verified:bool
-    is_deleted:bool
-    created_at: str
-    deleted_at: str
-    updated_at: str
 
 class UserCreateResponse(BaseModel):
     id:int

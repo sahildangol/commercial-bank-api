@@ -9,7 +9,7 @@ class UserService(BaseService):
         stmt=text(
             """
             INSERT INTO "Users" (first_name,last_name,email,password,is_verified)
-            VALUES (:first_name,:last_name,:email,:password,:is_verified)
+            VALUES (:first_name,:last_name,:email,:password,false)
             RETURNING id,first_name,last_name,email,is_verified
             """
         )
@@ -29,7 +29,7 @@ class UserService(BaseService):
             """
             SELECT id,first_name,last_name,email,password,is_verified
             FROM "Users"
-            WHERE email = :email
+            WHERE email = :email AND is_deleted = false
             LIMIT 1
             """
         )
@@ -41,7 +41,7 @@ class UserService(BaseService):
             """
             SELECT id,first_name,last_name,email,is_verified
             FROM "Users"
-            WHERE id = :user_id
+            WHERE id = :user_id AND is_deleted = false
             LIMIT 1
             """
         )
@@ -52,8 +52,8 @@ class UserService(BaseService):
         stmt=text(
             """
             UPDATE "Users"
-            SET password = :password
-            WHERE id = :user_id
+            SET password = :password, updated_at = NOW()
+            WHERE id = :user_id AND is_deleted = false
             RETURNING id
             """
         )
@@ -70,7 +70,7 @@ class UserService(BaseService):
         
     def updateUser(self,user_details:UserUpdate,user_id:int):
         updated_data=user_details.model_dump(exclude_unset=True)
-        user=self.session.query(User).filter(User.id==user_id).first()
+        user=self.session.query(User).filter(User.id==user_id,User.is_deleted==False).first()
         if not user:
             return None
         for field,value in updated_data.items():

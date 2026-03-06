@@ -14,6 +14,6 @@ notebooks/__pycache__/
 notebooks/*.pyc
 notebooks/*.pyd
 output/
-models/
+/models/
 .env
 *.pyc
