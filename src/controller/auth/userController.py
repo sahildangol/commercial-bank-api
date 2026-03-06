@@ -1,5 +1,5 @@
 from src.service.userService import UserService
-from src.db.schema.user import UserCreate,UserCreateResponse,UserLogin,UserLoginResponse,UserUpdatePassword,UserUpdatePasswordResponse
+from src.db.schema.user import UserCreate,UserCreateResponse,UserLogin,UserLoginResponse,UserUpdatePassword,UserUpdatePasswordResponse,UserUpdate
 from src.core.auth.hashHandler import HashHelper
 from src.core.auth.authHandler import AuthHandler
 from sqlalchemy.orm import Session
@@ -50,3 +50,10 @@ class UserController:
                 raise HTTPException(status_code=404,detail="User is Not Available")
             return UserUpdatePasswordResponse(message="Password updated successfully")
         raise HTTPException(status_code=400,detail="Invalid Credentials")
+
+    def updateUser(self,user_details:UserUpdate,user_id)->UserUpdatePasswordResponse:
+        user=self.__userService.get_user_by_id(user_id=user_id)
+        if user:
+            self.__userService.updateUser(user_details=user_details,user_id=user_id)
+            return UserUpdatePasswordResponse(message="User Updated Successfully")
+        raise HTTPException(status_code=404,detail="User is Not Available")

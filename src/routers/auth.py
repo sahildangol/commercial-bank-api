@@ -1,5 +1,5 @@
 from fastapi import APIRouter,Depends
-from src.db.schema.user import UserCreate,UserLogin,UserCreateResponse,UserLoginResponse,UserUpdatePassword,UserUpdatePasswordResponse
+from src.db.schema.user import UserCreate,UserLogin,UserCreateResponse,UserLoginResponse,UserUpdatePassword,UserUpdatePasswordResponse,UserUpdate
 from src.core.database import get_db
 from sqlalchemy.orm import Session
 from src.controller.auth.userController import UserController
@@ -26,6 +26,14 @@ def signup(signUpDetails:UserCreate,session:Session=Depends(get_db)):
 def changePassword(change_password_details:UserUpdatePassword,session:Session=Depends(get_db)):
     try:
         return UserController(session=session).changePassword(change_password_details=change_password_details)
+    except Exception as e:
+        print(f"Exception Occured at {e}")
+        raise e
+    
+@authRouter.patch("/update-user/{id}",status_code=200,response_model=UserUpdatePasswordResponse)
+def upateUser(id:int,user_details:UserUpdate,session:Session=Depends(get_db)):
+    try:
+        return UserController(session=session).updateUser(user_details=user_details,user_id=id)
     except Exception as e:
         print(f"Exception Occured at {e}")
         raise e

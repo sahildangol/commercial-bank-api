@@ -1,5 +1,6 @@
 from .base import BaseService
-from src.db.schema.user import UserCreate
+from src.db.schema.user import UserCreate,UserUpdate
+from src.db.models.user import User
 from sqlalchemy import text
 from typing import Optional
 
@@ -67,3 +68,13 @@ class UserService(BaseService):
         self.session.commit()
         return True
         
+    def updateUser(self,user_details:UserUpdate,user_id:int):
+        updated_data=user_details.model_dump(exclude_unset=True)
+        user=self.session.query(User).filter(User.id==user_id).first()
+        if not user:
+            return None
+        for field,value in updated_data.items():
+            setattr(user,field,value)
+        self.session.commit()
+        self.session.refresh(user)
+        return user

@@ -7,6 +7,10 @@ class UserCreate(BaseModel):
     email:EmailStr
     password:str
     is_verified:bool
+    is_deleted:bool
+    created_at: str
+    deleted_at: str
+    updated_at: str
 
 class UserCreateResponse(BaseModel):
     id:int
@@ -23,7 +27,6 @@ class UserPublicResponse(BaseModel):
     is_verified:bool
 
 class UserUpdate(BaseModel):
-    id:int
     first_name:Union[str,None]=None
     last_name:Union[str,None]=None
     email:Union[EmailStr,None]=None
