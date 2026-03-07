@@ -1,5 +1,5 @@
 from src.core.database import Base
-from sqlalchemy import Column,Integer,String,Boolean,DateTime,Float,func,text,DDL,event
+from sqlalchemy import Column,Integer,String,Boolean,DateTime,BigInteger,func,text,DDL,event
 
 class Company(Base):
     __tablename__="Company"
@@ -7,7 +7,7 @@ class Company(Base):
     symbol=Column(String(50),nullable=False)
     company_name=Column(String(50),nullable=False)
     sector=Column(String(50),nullable=False)
-    listed_shares=Column(Float,nullable=False)
+    listed_shares=Column(BigInteger,nullable=False)
     is_active=Column(Boolean,default=False,server_default=text("false"),nullable=False)
     created_at=Column(DateTime(timezone=True),server_default=func.now(),nullable=False)
     updated_at=Column(DateTime(timezone=True),server_default=func.now(),onupdate=func.now(),nullable=False)

@@ -4,10 +4,10 @@ from sqlalchemy import Column,Integer,String,Boolean,DateTime,func,text,DDL,even
 class User(Base):
     __tablename__="Users"
     id=Column(Integer,primary_key=True)
-    first_name=Column(String(50))
-    last_name=Column(String(50))
-    email=Column(String(50),unique=True)
-    password=Column(String(250))
+    first_name=Column(String(100))
+    last_name=Column(String(100))
+    email=Column(String(255),unique=True)
+    password=Column(String(255))
     is_verified=Column(Boolean,default=False,server_default=text("false"),nullable=False)
     is_deleted=Column(Boolean,default=False,server_default=text("false"),nullable=False)
     created_at=Column(DateTime(timezone=True),server_default=func.now(),nullable=False)

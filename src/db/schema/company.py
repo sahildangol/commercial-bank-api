@@ -6,7 +6,7 @@ class CompanyCreate(BaseModel):
     symbol: str
     company_name: str
     sector: str
-    listed_shares: float
+    listed_shares: int
     is_active: bool = False
 
 
@@ -14,7 +14,7 @@ class CompanyUpdate(BaseModel):
     symbol: str | None = None
     company_name: str | None = None
     sector: str | None = None
-    listed_shares: float | None = None
+    listed_shares: int | None = None
     is_active: bool | None = None
 
 
@@ -25,7 +25,7 @@ class CompanyResponse(BaseModel):
     symbol: str
     company_name: str
     sector: str
-    listed_shares: float
+    listed_shares: int
     is_active: bool
     created_at: datetime
     updated_at: datetime
