@@ -67,13 +67,14 @@ class NEPSEInferencePipeline:
     All feature engineering is identical to training — no drift.
     """
 
-    def __init__(self, model_dir: str = 'model_artifacts'):
+    def __init__(self, model_dir: str = 'model_artifacts', verbose: bool = True):
         self.model_dir = model_dir
+        self.verbose = verbose
         self._load_artifacts()
 
     def _load_artifacts(self):
         """Load all model artifacts from disk."""
-        print(f"Loading model artifacts from: {self.model_dir}/")
+        self._log(f"Loading model artifacts from: {self.model_dir}/")
 
         def load(name):
             path = os.path.join(self.model_dir, f'model_{name}.pkl')
@@ -93,9 +94,9 @@ class NEPSEInferencePipeline:
         self.long_thresh     = self.meta['signal_thresholds']['LONG']
         self.hold_thresh     = self.meta['signal_thresholds']['HOLD']
 
-        print(f"  Models loaded. Features: {len(self.features)}")
-        print(f"  Trained on data up to: {self.meta['train_end']}")
-        print(f"  Validated AUC: {self.meta['metrics']['te_auc_ens']:.4f}")
+        self._log(f"  Models loaded. Features: {len(self.features)}")
+        self._log(f"  Trained on data up to: {self.meta['train_end']}")
+        self._log(f"  Validated AUC: {self.meta['metrics']['te_auc_ens']:.4f}")
 
     # ── PUBLIC API ────────────────────────────────────────────────────────────
     def predict(
@@ -195,8 +196,10 @@ class NEPSEInferencePipeline:
         # Warn on insufficient history
         for bk, g in df.groupby('bank'):
             if len(g) < MIN_ROWS_REQUIRED:
-                print(f"  ⚠ WARNING: {bk} has only {len(g)} rows "
-                      f"(need ≥{MIN_ROWS_REQUIRED}). Features may be NaN.")
+                self._log(
+                    f"  WARNING: {bk} has only {len(g)} rows "
+                    f"(need >= {MIN_ROWS_REQUIRED}). Features may be NaN."
+                )
         return df
 
     def _prepare_nepse(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -241,7 +244,7 @@ class NEPSEInferencePipeline:
                 # Use sector median as fallback
                 df.loc[mask, 'car'] = np.nan
                 df.loc[mask, 'npl'] = np.nan
-                print(f"  ⚠ WARNING: No fundamentals for {bk}. Using NaN (model will estimate).")
+                self._log(f"  WARNING: No fundamentals for {bk}. Using NaN (model will estimate).")
 
         # Fill any missing fundamental with cross-bank median
         for col in ['car', 'npl']:
@@ -375,6 +378,10 @@ class NEPSEInferencePipeline:
                   f"{r['ensemble_score']:7.3f}  {r['car']:6.1f} {r['npl']:6.2f}  "
                   f"{icon} {r['signal']}")
         print(f"{'='*72}\n")
+
+    def _log(self, message: str):
+        if self.verbose:
+            print(message)
 
 
 # ── DEMO — runs with real uploaded data ──────────────────────────────────────

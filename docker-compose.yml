@@ -1,4 +1,21 @@
 services:
+  nepseapi:
+    image: surajrimal/nepseapi:latest
+    container_name: nepseapi
+    ports:
+      - "8000:8000"   # REST API
+      - "5555:5555"   # WebSocket server
+      - "8080:8080"   # MCP server
+    restart: unless-stopped
+    # Use the image's built-in Python healthcheck — do NOT override with curl
+    # (curl is not available in the image). We only extend the timing.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import http.client; conn = http.client.HTTPConnection('localhost:8000'); conn.request('GET', '/health'); r = conn.getresponse(); exit(0 if r.status == 200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
   app:
     build:
       context: .
@@ -9,12 +26,27 @@ services:
     environment:
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
+      NEPSE_PRICE_VOLUME_URL_TEMPLATE: "http://nepseapi:8000/PriceVolumeHistory?symbol={symbol}"
     ports:
-      - "8000:8000"
+      - "8001:8001"
     depends_on:
       db:
         condition: service_healthy
+      nepseapi:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   db:
     image: postgres:16
@@ -27,6 +59,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s

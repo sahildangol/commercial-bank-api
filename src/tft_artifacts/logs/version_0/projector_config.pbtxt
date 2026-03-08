@@ -1,0 +1,5 @@
+embeddings {
+  tensor_name: "bank:10668"
+  metadata_path: "10668/bank/metadata.tsv"
+  tensor_path: "10668/bank/tensors.tsv"
+}

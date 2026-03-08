@@ -1,0 +1,68 @@
+{
+  "best_checkpoint": "/content/tft_artifacts/tft-best-epoch=00-val_loss=0.0794.ckpt",
+  "dataset_path": "tft_artifacts/training_dataset.pt",
+  "encoder_len": 63,
+  "pred_len": 21,
+  "hidden_size": 32,
+  "known_reals": [
+    "month",
+    "fy_end",
+    "policy_rate",
+    "day_of_week",
+    "is_gap"
+  ],
+  "unknown_reals": [
+    "log_return",
+    "momentum_20d",
+    "volatility_20d",
+    "volume_z",
+    "risk_stability",
+    "ret_5d",
+    "ret_21d",
+    "p_ema50",
+    "p_ema200",
+    "car",
+    "npl",
+    "npl_zscore",
+    "nepse_bull",
+    "nepse_ret_5d",
+    "nepse_ret_21d",
+    "alpha_21d"
+  ],
+  "banks": [
+    "ADBL",
+    "CZBIL",
+    "EBL",
+    "GBIME",
+    "HBL",
+    "KBL",
+    "NABIL",
+    "NICA",
+    "NMB",
+    "PCBL",
+    "SANIMA",
+    "SBL",
+    "SCB"
+  ],
+  "train_end": "2024-04-16",
+  "test_start": "2024-12-11",
+  "metrics": {
+    "train": {
+      "auc": 0.6667,
+      "acc": 0.3077,
+      "f1": 0.4706
+    },
+    "val": {
+      "auc": NaN,
+      "acc": 0.0,
+      "f1": 0.0
+    },
+    "test": {
+      "auc": 0.4,
+      "acc": 0.3846,
+      "f1": 0.5556
+    },
+    "overfit_gap": 0.2667
+  },
+  "trained_at": "2026-03-08T16:51:48.136216"
+}

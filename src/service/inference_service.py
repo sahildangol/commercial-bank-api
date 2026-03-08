@@ -1,8 +1,10 @@
 import importlib
+import importlib.util
 import json
 import os
 from datetime import date, datetime, time
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -11,7 +13,6 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from notebooks.inference_pipeline import NEPSEInferencePipeline, POLICY_RATE_FALLBACK
 from src.db.models.company import Company
 from src.db.models.inference import ModelVersion, Prediction
 from src.db.schema.inference import (
@@ -25,9 +26,39 @@ from src.db.schema.inference import (
 )
 
 
+def _load_inference_pipeline() -> tuple[type, float]:
+    try:
+        from notebooks.inference_pipeline import NEPSEInferencePipeline, POLICY_RATE_FALLBACK
+
+        return NEPSEInferencePipeline, POLICY_RATE_FALLBACK
+    except ModuleNotFoundError as exc:
+        pipeline_file = Path(__file__).resolve().parents[2] / "notebooks" / "inference_pipeline.py"
+        if not pipeline_file.exists():
+            raise exc
+
+        spec = importlib.util.spec_from_file_location("notebooks.inference_pipeline", pipeline_file)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load inference pipeline from: {pipeline_file}")
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        pipeline_cls = getattr(module, "NEPSEInferencePipeline", None)
+        if pipeline_cls is None:
+            raise RuntimeError(
+                f"NEPSEInferencePipeline class is missing in {pipeline_file}"
+            )
+
+        fallback_policy_rate = float(getattr(module, "POLICY_RATE_FALLBACK", 4.5))
+        return pipeline_cls, fallback_policy_rate
+
+
+NEPSEInferencePipeline, POLICY_RATE_FALLBACK = _load_inference_pipeline()
+
+
 @lru_cache(maxsize=4)
-def get_pipeline(model_dir: str) -> NEPSEInferencePipeline:
-    return NEPSEInferencePipeline(model_dir=model_dir)
+def get_pipeline(model_dir: str, verbose: bool) -> NEPSEInferencePipeline:
+    return NEPSEInferencePipeline(model_dir=model_dir, verbose=verbose)
 
 
 class InferenceService:
@@ -38,6 +69,12 @@ class InferenceService:
         self.scraper_function = os.getenv("NEPSE_SCRAPER_FUNCTION", "scrape_market_data")
         self.model_type = os.getenv("MODEL_TYPE", "ensemble")
         self.model_target = os.getenv("MODEL_TARGET", "signal_21d")
+        self.pipeline_verbose = os.getenv("INFERENCE_PIPELINE_VERBOSE", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def predict(self, payload: InferenceRequest) -> InferenceResponse:
         symbol = payload.symbol.strip().upper()
@@ -79,7 +116,7 @@ class InferenceService:
             policy_rate = float(scraped.get("policy_rate", POLICY_RATE_FALLBACK))
 
         try:
-            signals = get_pipeline(self.model_dir).predict(
+            signals = get_pipeline(self.model_dir, self.pipeline_verbose).predict(
                 ohlcv_df=ohlcv_df,
                 nepse_df=nepse_df,
                 fundamentals=fundamentals,
@@ -134,6 +171,31 @@ class InferenceService:
             .order_by(ModelVersion.is_active.desc(), ModelVersion.id.desc())
             .all()
         )
+
+    def list_supported_symbols(self) -> list[str]:
+        from_db = (
+            self.session.query(Company.symbol)
+            .filter(Company.is_active.is_(True))
+            .order_by(Company.symbol.asc())
+            .all()
+        )
+        db_symbols = [str(row[0]).strip().upper() for row in from_db if row[0]]
+
+        try:
+            module = importlib.import_module(self.scraper_module)
+        except ModuleNotFoundError:
+            return sorted(set(db_symbols))
+
+        get_symbols = getattr(module, "list_supported_symbols", None)
+        if not callable(get_symbols):
+            return sorted(set(db_symbols))
+
+        try:
+            scraper_symbols = [str(item).strip().upper() for item in get_symbols() if str(item).strip()]
+        except Exception:
+            scraper_symbols = []
+
+        return sorted(set(db_symbols) | set(scraper_symbols))
 
     def activate_model_version(self, model_version_id: int) -> ModelVersion:
         model_version = self.session.query(ModelVersion).filter(ModelVersion.id == model_version_id).first()
@@ -284,7 +346,16 @@ class InferenceService:
             .order_by(Company.company_id.asc())
             .first()
         )
-        if not company:
+        if company:
+            return company
+
+        auto_create_company = os.getenv("INFERENCE_AUTO_CREATE_COMPANY", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not auto_create_company:
             raise HTTPException(
                 status_code=404,
                 detail=(
@@ -292,7 +363,33 @@ class InferenceService:
                     "Create it first via POST /company."
                 ),
             )
-        return company
+
+        created = Company(
+            symbol=symbol,
+            company_name=symbol,
+            sector="Commercial Banks",
+            listed_shares=0,
+            is_active=True,
+        )
+        self.session.add(created)
+        try:
+            self.session.commit()
+            self.session.refresh(created)
+            return created
+        except IntegrityError:
+            self.session.rollback()
+            company = (
+                self.session.query(Company)
+                .filter(func.upper(Company.symbol) == symbol.upper())
+                .order_by(Company.company_id.asc())
+                .first()
+            )
+            if company:
+                return company
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to auto-create company for symbol '{symbol}'.",
+            )
 
     def _get_active_model_version(self) -> ModelVersion:
         active = (
@@ -310,7 +407,7 @@ class InferenceService:
         return self._create_model_version_from_meta()
 
     def _create_model_version_from_meta(self) -> ModelVersion:
-        meta = get_pipeline(self.model_dir).meta
+        meta = get_pipeline(self.model_dir, self.pipeline_verbose).meta
         metrics = meta.get("metrics", {})
         features = meta.get("model_features", [])
         trained_at = self._parse_datetime(meta.get("trained_at")) or datetime.utcnow()

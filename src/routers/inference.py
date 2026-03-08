@@ -7,6 +7,7 @@ from src.core.database import get_db
 from src.db.schema.inference import (
     InferenceRequest,
     InferenceResponse,
+    InferenceSimpleRequest,
     ModelVersionCreate,
     ModelVersionResponse,
     PredictionOutcomeUpdate,
@@ -18,8 +19,21 @@ inferenceRouter = APIRouter()
 
 
 @inferenceRouter.post("/predict", status_code=200, response_model=InferenceResponse)
-def predict_symbol_signal(payload: InferenceRequest, session: Session = Depends(get_db)):
+def predict_symbol_signal(payload: InferenceSimpleRequest, session: Session = Depends(get_db)):
+    request = InferenceRequest(symbol=payload.symbol)
+    result = InferenceService(session=session).predict(request)
+    result.all_signals = None
+    return result
+
+
+@inferenceRouter.post("/predict/advanced", status_code=200, response_model=InferenceResponse)
+def predict_symbol_signal_advanced(payload: InferenceRequest, session: Session = Depends(get_db)):
     return InferenceService(session=session).predict(payload)
+
+
+@inferenceRouter.get("/supported-symbols", status_code=200, response_model=list[str])
+def list_supported_symbols(session: Session = Depends(get_db)):
+    return InferenceService(session=session).list_supported_symbols()
 
 
 @inferenceRouter.post("/model-versions", status_code=201, response_model=ModelVersionResponse)

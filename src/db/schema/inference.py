@@ -8,7 +8,29 @@ class FundamentalInput(BaseModel):
     npl: float | None = None
 
 
+class InferenceSimpleRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "symbol": "NABIL",
+            }
+        }
+    )
+
+    symbol: str = Field(min_length=1, description="Bank symbol, e.g. NABIL")
+
+
 class InferenceRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "symbol": "NABIL",
+                "timeframe": "1d",
+                "lookback_days": 320,
+            }
+        }
+    )
+
     symbol: str = Field(min_length=1, description="Bank symbol, e.g. NABIL")
     timeframe: str = Field(default="1d", min_length=1)
     lookback_days: int = Field(default=320, ge=250, le=2000)
