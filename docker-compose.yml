@@ -3,14 +3,19 @@ services:
     image: surajrimal/nepseapi:latest
     container_name: nepseapi
     ports:
-      - "8000:8000"   # REST API
-      - "5555:5555"   # WebSocket server
-      - "8080:8080"   # MCP server
+      - "8000:8000" # REST API
+      - "5555:5555" # WebSocket server
+      - "8080:8080" # MCP server
     restart: unless-stopped
-    # Use the image's built-in Python healthcheck — do NOT override with curl
-    # (curl is not available in the image). We only extend the timing.
+
     healthcheck:
-      test: ["CMD", "python", "-c", "import http.client; conn = http.client.HTTPConnection('localhost:8000'); conn.request('GET', '/health'); r = conn.getresponse(); exit(0 if r.status == 200 else 1)"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import http.client; conn = http.client.HTTPConnection('localhost:8000'); conn.request('GET', '/health'); r = conn.getresponse(); exit(0 if r.status == 200 else 1)",
+        ]
       interval: 15s
       timeout: 10s
       retries: 5
