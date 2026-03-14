@@ -4,16 +4,12 @@ build/
 .mypy_cache/
 .pytest_cache/
 .vscode/
-*.pkl
 *.joblib
-*.csv
 *.xls
 *.xlsx
-data/
 notebooks/__pycache__/
 notebooks/*.pyc
 notebooks/*.pyd
 output/
-/models/
 .env
 *.pyc

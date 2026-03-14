@@ -67,8 +67,8 @@ class InferenceService:
         self.model_dir = os.getenv("MODEL_DIR", "models")
         self.scraper_module = os.getenv("NEPSE_SCRAPER_MODULE", "src.scripts.nepse_scraper")
         self.scraper_function = os.getenv("NEPSE_SCRAPER_FUNCTION", "scrape_market_data")
-        self.model_type = os.getenv("MODEL_TYPE", "ensemble")
-        self.model_target = os.getenv("MODEL_TARGET", "signal_21d")
+        self.model_type = os.getenv("MODEL_TYPE", "histgb")
+        self.model_target = os.getenv("MODEL_TARGET", "next_day")
         self.pipeline_verbose = os.getenv("INFERENCE_PIPELINE_VERBOSE", "false").strip().lower() in {
             "1",
             "true",
@@ -409,9 +409,17 @@ class InferenceService:
     def _create_model_version_from_meta(self) -> ModelVersion:
         meta = get_pipeline(self.model_dir, self.pipeline_verbose).meta
         metrics = meta.get("metrics", {})
-        features = meta.get("model_features", [])
+        features = meta.get("model_features") or meta.get("feature_cols") or []
         trained_at = self._parse_datetime(meta.get("trained_at")) or datetime.utcnow()
-        train_end_date = self._parse_date(meta.get("train_end")) or datetime.utcnow().date()
+        train_end_value = meta.get("train_end") or meta.get("train_cutoff") or meta.get("train_end_date")
+        train_end_date = self._parse_date(train_end_value) or datetime.utcnow().date()
+
+        train_auc = self._to_optional_float(metrics.get("tr_auc_ens"))
+        test_auc = self._to_optional_float(metrics.get("te_auc_ens"))
+        if test_auc is None:
+            test_auc = self._to_optional_float(meta.get("cv_mean_auc"))
+        train_r2 = self._to_optional_float(metrics.get("tr_r2"))
+        test_r2 = self._to_optional_float(metrics.get("te_r2"))
 
         self._deactivate_versions(model_type=self.model_type, target=self.model_target)
         model_version = ModelVersion(
@@ -420,10 +428,10 @@ class InferenceService:
             trained_at=trained_at,
             train_end_date=train_end_date,
             n_features=int(meta.get("n_features", len(features))),
-            train_auc=self._to_optional_float(metrics.get("tr_auc_ens")),
-            test_auc=self._to_optional_float(metrics.get("te_auc_ens")),
-            train_r2=self._to_optional_float(metrics.get("tr_r2")),
-            test_r2=self._to_optional_float(metrics.get("te_r2")),
+            train_auc=train_auc,
+            test_auc=test_auc,
+            train_r2=train_r2,
+            test_r2=test_r2,
             feature_list=json.dumps(features),
             notes="Auto-created from model_meta.json.",
             is_active=True,
@@ -496,15 +504,37 @@ class InferenceService:
             raise
 
     def _prediction_to_signal(self, symbol: str, prediction: Prediction) -> InferenceSignal:
+        prob_up = float(prediction.prob_direction_up)
+        prob_down = 1.0 - prob_up
+        threshold = self._current_threshold()
+        signal_value = str(prediction.signal) if prediction.signal is not None else ""
+        if signal_value.upper() in {"UP", "DOWN"}:
+            direction = signal_value.upper()
+        else:
+            direction = "UP" if prob_up > threshold else "DOWN"
+        return_mag = float(prediction.predicted_magnitude) / 100.0
+        return_mag_pct = f"{return_mag * 100:+.3f}%"
+        confidence = self._confidence_label(prob_up)
+        signal_strength = self._signal_strength_label(return_mag)
+
         return InferenceSignal(
             bank=symbol,
             date=datetime.combine(prediction.prediction_date, time.min),
             close=prediction.close_at_signal,
-            prob_direction=prediction.prob_direction_up,
+            prob_direction=prob_up,
             prob_momentum=prediction.prob_momentum_5d,
             predicted_mag=prediction.predicted_magnitude,
             ensemble_score=prediction.ensemble_score,
-            signal=prediction.signal,
+            signal=direction,
+            direction=direction,
+            prob_up=prob_up,
+            prob_down=prob_down,
+            return_magnitude=return_mag,
+            return_magnitude_pct=return_mag_pct,
+            confidence=confidence,
+            signal_strength=signal_strength,
+            threshold_used=threshold,
+            nan_features=None,
             car=None,
             npl=None,
         )
@@ -534,18 +564,98 @@ class InferenceService:
         return None
 
     def _row_to_signal(self, row: pd.Series) -> InferenceSignal:
+        prob_direction = float(row["prob_direction"])
+        prob_momentum = self._to_optional_float(row.get("prob_momentum"))
+        if prob_momentum is None:
+            prob_momentum = prob_direction
+
+        ensemble_score = self._to_optional_float(row.get("ensemble_score"))
+        if ensemble_score is None:
+            ensemble_score = prob_direction
+
+        predicted_mag = float(row["predicted_mag"])
+        prob_up = self._to_optional_float(row.get("prob_up"))
+        if prob_up is None:
+            prob_up = prob_direction
+        prob_down = self._to_optional_float(row.get("prob_down"))
+        if prob_down is None and prob_up is not None:
+            prob_down = 1.0 - prob_up
+
+        return_mag = self._to_optional_float(row.get("return_magnitude"))
+        if return_mag is None:
+            return_mag = predicted_mag / 100.0
+
+        threshold = self._to_optional_float(row.get("threshold_used"))
+        if threshold is None:
+            threshold = self._current_threshold()
+
+        direction = row.get("direction")
+        if not direction or (isinstance(direction, float) and pd.isna(direction)):
+            direction = row.get("signal")
+        if not direction:
+            direction = "UP" if prob_direction > threshold else "DOWN"
+
+        confidence = row.get("confidence")
+        if not confidence or (isinstance(confidence, float) and pd.isna(confidence)):
+            confidence = self._confidence_label(prob_up)
+
+        signal_strength = row.get("signal_strength")
+        if not signal_strength or (isinstance(signal_strength, float) and pd.isna(signal_strength)):
+            signal_strength = self._signal_strength_label(return_mag)
+
+        return_mag_pct = row.get("return_magnitude_pct")
+        if not return_mag_pct or (isinstance(return_mag_pct, float) and pd.isna(return_mag_pct)):
+            return_mag_pct = f"{return_mag * 100:+.3f}%"
+
+        nan_features = row.get("nan_features")
+        if not isinstance(nan_features, list):
+            nan_features = None
+
         return InferenceSignal(
             bank=str(row["bank"]),
             date=pd.to_datetime(row["date"]).to_pydatetime(),
             close=float(row["close"]),
-            prob_direction=float(row["prob_direction"]),
-            prob_momentum=float(row["prob_momentum"]),
-            predicted_mag=float(row["predicted_mag"]),
-            ensemble_score=float(row["ensemble_score"]),
+            prob_direction=prob_direction,
+            prob_momentum=prob_momentum,
+            predicted_mag=predicted_mag,
+            ensemble_score=ensemble_score,
             signal=str(row["signal"]),
+            direction=str(direction),
+            prob_up=prob_up,
+            prob_down=prob_down,
+            return_magnitude=return_mag,
+            return_magnitude_pct=str(return_mag_pct),
+            confidence=str(confidence),
+            signal_strength=str(signal_strength),
+            threshold_used=threshold,
+            nan_features=nan_features,
             car=self._to_optional_float(row.get("car")),
             npl=self._to_optional_float(row.get("npl")),
         )
+
+    def _current_threshold(self) -> float:
+        try:
+            pipeline = get_pipeline(self.model_dir, self.pipeline_verbose)
+            threshold = float(getattr(pipeline, "threshold", 0.5))
+        except Exception:
+            threshold = 0.5
+        return threshold
+
+    def _confidence_label(self, prob_up: float) -> str:
+        margin = abs(prob_up - 0.5)
+        if margin >= 0.12:
+            return "HIGH"
+        if margin >= 0.06:
+            return "MEDIUM"
+        return "LOW"
+
+    def _signal_strength_label(self, return_mag: float) -> str:
+        abs_ret = abs(return_mag)
+        if abs_ret >= 0.02:
+            return "STRONG"
+        if abs_ret >= 0.01:
+            return "MODERATE"
+        return "WEAK"
 
     def _to_optional_float(self, value: Any) -> float | None:
         if pd.isna(value):

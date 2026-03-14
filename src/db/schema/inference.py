@@ -51,6 +51,15 @@ class InferenceSignal(BaseModel):
     predicted_mag: float
     ensemble_score: float
     signal: str
+    direction: str | None = None
+    prob_up: float | None = None
+    prob_down: float | None = None
+    return_magnitude: float | None = None
+    return_magnitude_pct: str | None = None
+    confidence: str | None = None
+    signal_strength: str | None = None
+    threshold_used: float | None = None
+    nan_features: list[str] | None = None
     car: float | None = None
     npl: float | None = None
 

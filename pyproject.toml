@@ -20,4 +20,5 @@ dependencies = [
     "selenium>=4.41.0",
     "sqlalchemy>=2.0.48",
     "webdriver-manager>=4.0.2",
+    "xgboost>=3.2.0",
 ]

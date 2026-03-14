@@ -123,7 +123,7 @@ def _load_active_banks_from_meta() -> list[str]:
     except Exception:  # noqa: BLE001
         return []
 
-    active_banks = meta.get("active_banks")
+    active_banks = meta.get("active_banks") or meta.get("bank_classes") or meta.get("banks")
     if not isinstance(active_banks, list):
         return []
     return [str(bank).strip().upper() for bank in active_banks if str(bank).strip()]

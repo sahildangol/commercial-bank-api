@@ -239,6 +239,7 @@ def run(input_path: str, outdir: str):
     # Feature importance
     print("\n[5/6] Computing feature importance...")
     fi = compute_importance(clf_dir, X_te, y_dir_te)
+    
     print("  Top 10 features:")
     for feat, val in fi.head(10).items():
         print(f"    {feat:28s} {val:.4f}")
