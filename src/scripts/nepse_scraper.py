@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 
 URL_TEMPLATE_ENV = "NEPSE_PRICE_VOLUME_URL_TEMPLATE"
-DEFAULT_URL_TEMPLATE = "http://0.0.0.0:8000/PriceVolumeHistory?symbol={symbol}"
+DEFAULT_URL_TEMPLATE = "http://127.0.0.1:8000/PriceVolumeHistory?symbol={symbol}"
 LOCAL_HOSTS = ("0.0.0.0", "127.0.0.1", "localhost", "host.docker.internal")
 LOCAL_BANK_DATA_DIR_ENV = "NEPSE_LOCAL_BANK_DATA_DIR"
 DEFAULT_LOCAL_BANK_DATA_DIR = "data/raw"
@@ -32,11 +32,14 @@ def scrape_market_data(symbol: str, timeframe: str = "1d", lookback_days: int = 
 
     symbols_to_fetch = _resolve_symbols_to_fetch(target_symbol)
     histories: dict[str, list[dict[str, Any]]] = {}
+    sources: dict[str, dict[str, str | None]] = {}
     optional_errors: list[str] = []
 
     for bank_symbol in symbols_to_fetch:
         try:
-            raw_history = _fetch_price_volume_history(bank_symbol)
+            raw_history, source_kind, source_ref, source_errors = _fetch_price_volume_history(
+                bank_symbol
+            )
             normalized = _normalize_ohlcv_rows(
                 symbol=bank_symbol,
                 raw_rows=raw_history,
@@ -44,6 +47,11 @@ def scrape_market_data(symbol: str, timeframe: str = "1d", lookback_days: int = 
             )
             if normalized:
                 histories[bank_symbol] = normalized
+                sources[bank_symbol] = {
+                    "source": source_kind,
+                    "reference": source_ref,
+                    "remote_errors": source_errors if source_errors else None,
+                }
         except Exception as exc:  # noqa: BLE001
             if bank_symbol == target_symbol:
                 raise RuntimeError(
@@ -64,12 +72,20 @@ def scrape_market_data(symbol: str, timeframe: str = "1d", lookback_days: int = 
 
     nepse_rows = _build_nepse_rows(histories=histories, lookback_days=lookback_days)
     fundamentals = _build_fundamentals(list(histories.keys()))
+    target_source = sources.get(target_symbol, {})
 
     return {
         "ohlcv": ohlcv_rows,
         "nepse": nepse_rows,
         "fundamentals": fundamentals,
         "policy_rate": _get_env_float("NEPSE_POLICY_RATE", 4.5),
+        "source": {
+            "target_symbol": target_symbol,
+            "target_source": target_source,
+            "symbols_requested": symbols_to_fetch,
+            "symbols_loaded": sorted(histories.keys()),
+            "per_symbol": sources,
+        },
     }
 
 
@@ -94,7 +110,7 @@ def list_supported_symbols() -> list[str]:
 def _resolve_symbols_to_fetch(target_symbol: str) -> list[str]:
     symbols = [target_symbol]
     fetch_all_active = _is_truthy(os.getenv(FETCH_ALL_ACTIVE_BANKS_ENV, "false"))
-    force_active_context = _is_truthy(os.getenv(FORCE_ACTIVE_BANK_CONTEXT_ENV, "true"))
+    force_active_context = _is_truthy(os.getenv(FORCE_ACTIVE_BANK_CONTEXT_ENV, "false"))
     if fetch_all_active or force_active_context:
         symbols.extend(_load_active_banks_from_meta())
 
@@ -114,29 +130,40 @@ def _resolve_symbols_to_fetch(target_symbol: str) -> list[str]:
 
 
 def _load_active_banks_from_meta() -> list[str]:
-    model_dir = Path(os.getenv("MODEL_DIR", "models"))
-    meta_path = model_dir / "model_meta.json"
-    if not meta_path.exists():
-        return []
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return []
+    model_dir = Path(os.getenv("MODEL_DIR", "src/tft_artifacts"))
+    candidate_files = [
+        model_dir / "model_meta.json",
+        model_dir / "tft_meta.json",
+        Path("src/tft_artifacts/tft_meta.json"),
+    ]
 
-    active_banks = meta.get("active_banks") or meta.get("bank_classes") or meta.get("banks")
-    if not isinstance(active_banks, list):
-        return []
-    return [str(bank).strip().upper() for bank in active_banks if str(bank).strip()]
+    for meta_path in candidate_files:
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+
+        active_banks = meta.get("active_banks") or meta.get("bank_classes") or meta.get("banks")
+        if not isinstance(active_banks, list):
+            continue
+        return [str(bank).strip().upper() for bank in active_banks if str(bank).strip()]
+
+    return []
 
 
-def _fetch_price_volume_history(symbol: str) -> list[dict[str, Any]]:
+def _fetch_price_volume_history(
+    symbol: str,
+) -> tuple[list[dict[str, Any]], str, str | None, list[str]]:
     errors: list[str] = []
-    prefer_local = _is_truthy(os.getenv(PREFER_LOCAL_DATA_ENV, "true"))
+    prefer_local = _is_truthy(os.getenv(PREFER_LOCAL_DATA_ENV, "false"))
 
     if prefer_local:
         local_rows = _load_local_price_volume_history(symbol)
         if local_rows:
-            return local_rows
+            csv_path = _resolve_local_bank_csv_path(symbol)
+            return local_rows, "local_csv", str(csv_path) if csv_path else None, []
 
     timeout = _get_env_float("NEPSE_API_TIMEOUT_SECONDS", 15.0)
 
@@ -160,12 +187,13 @@ def _fetch_price_volume_history(symbol: str) -> list[dict[str, Any]]:
         if rows is None:
             errors.append(f"{url} -> Unexpected JSON payload shape.")
             continue
-        return rows
+        return rows, "remote_api", url, errors
 
     if not prefer_local:
         local_rows = _load_local_price_volume_history(symbol)
         if local_rows:
-            return local_rows
+            csv_path = _resolve_local_bank_csv_path(symbol)
+            return local_rows, "local_csv", str(csv_path) if csv_path else None, errors
 
     raise RuntimeError(" | ".join(errors) if errors else "No endpoint URL resolved.")
 

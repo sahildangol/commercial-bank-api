@@ -21,14 +21,14 @@ inferenceRouter = APIRouter()
 @inferenceRouter.post("/predict", status_code=200, response_model=InferenceResponse)
 def predict_symbol_signal(payload: InferenceSimpleRequest, session: Session = Depends(get_db)):
     request = InferenceRequest(symbol=payload.symbol)
-    result = InferenceService(session=session).predict(request)
+    result = InferenceService(session=session).predict_ensemble(request)
     result.all_signals = None
     return result
 
 
 @inferenceRouter.post("/predict/advanced", status_code=200, response_model=InferenceResponse)
 def predict_symbol_signal_advanced(payload: InferenceRequest, session: Session = Depends(get_db)):
-    return InferenceService(session=session).predict(payload)
+    return InferenceService(session=session).predict_autotft(payload)
 
 
 @inferenceRouter.get("/supported-symbols", status_code=200, response_model=list[str])

@@ -13,3 +13,6 @@ notebooks/*.pyd
 output/
 .env
 *.pyc
+src/model/autotft/archive/
+
+

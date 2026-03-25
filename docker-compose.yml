@@ -29,7 +29,11 @@ services:
     env_file:
       - .env
     environment:
-      POSTGRES_HOST: db
+      POSTGRES_HOST: postgres_db
+      POSTGRES_HOST_FALLBACKS: db,postgres_db,localhost,127.0.0.1
+      DB_INIT_FAIL_HARD: false
+      DB_INIT_MAX_ATTEMPTS: 20
+      DB_INIT_RETRY_SECONDS: 2
       POSTGRES_PORT: 5432
       NEPSE_PRICE_VOLUME_URL_TEMPLATE: "http://nepseapi:8000/PriceVolumeHistory?symbol={symbol}"
     ports:

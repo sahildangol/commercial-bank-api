@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -6,6 +7,37 @@ from pydantic import BaseModel, ConfigDict, Field
 class FundamentalInput(BaseModel):
     car: float | None = None
     npl: float | None = None
+
+
+class ForecastPoint(BaseModel):
+    horizon_day: int
+    forecast_date: datetime
+    predicted_close: float
+    predicted_return: float
+    cumulative_return: float
+
+
+class TimelinePoint(BaseModel):
+    date: datetime
+    point_type: str
+    horizon_day: int | None = None
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    close: float
+    volume: float | None = None
+    predicted_return: float | None = None
+    cumulative_return: float | None = None
+
+
+class PastOHLCVPoint(BaseModel):
+    date: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float | None = None
+    amount: float | None = None
 
 
 class InferenceSimpleRequest(BaseModel):
@@ -17,7 +49,10 @@ class InferenceSimpleRequest(BaseModel):
         }
     )
 
-    symbol: str = Field(min_length=1, description="Bank symbol, e.g. NABIL")
+    symbol: str = Field(
+        min_length=1,
+        description="Bank symbol, e.g. NABIL. Uses the active ensemble model.",
+    )
 
 
 class InferenceRequest(BaseModel):
@@ -25,13 +60,14 @@ class InferenceRequest(BaseModel):
         json_schema_extra={
             "example": {
                 "symbol": "NABIL",
-                "timeframe": "1d",
-                "lookback_days": 320,
             }
         }
     )
 
-    symbol: str = Field(min_length=1, description="Bank symbol, e.g. NABIL")
+    symbol: str = Field(
+        min_length=1,
+        description="Bank symbol, e.g. NABIL. Uses the active AutoTFT model in advanced prediction.",
+    )
     timeframe: str = Field(default="1d", min_length=1)
     lookback_days: int = Field(default=320, ge=250, le=2000)
     prediction_date: date | None = Field(
@@ -49,7 +85,7 @@ class InferenceSignal(BaseModel):
     prob_direction: float
     prob_momentum: float
     predicted_mag: float
-    ensemble_score: float
+    model_score: float
     signal: str
     direction: str | None = None
     prob_up: float | None = None
@@ -62,11 +98,20 @@ class InferenceSignal(BaseModel):
     nan_features: list[str] | None = None
     car: float | None = None
     npl: float | None = None
+    forecast_next_5d: list[ForecastPoint] | None = None
+    timeline_10d: list[TimelinePoint] | None = None
 
 
 class InferenceResponse(BaseModel):
     prediction_id: int
-    model_version_id: int
+    model_version_id: int = Field(
+        description="Resolved active model version used for this prediction."
+    )
+    model_type: str
+    model_target: str
+    model_checkpoint: str | None = None
+    data_source: str | None = None
+    data_source_details: dict[str, Any] | None = None
     prediction_date: date
     from_cache: bool
     symbol: str
@@ -77,6 +122,7 @@ class InferenceResponse(BaseModel):
     rows_nepse: int
     selected_signal: InferenceSignal
     all_signals: list[InferenceSignal] | None = None
+    past_5_days: list[PastOHLCVPoint] | None = None
 
 
 class ModelVersionCreate(BaseModel):
