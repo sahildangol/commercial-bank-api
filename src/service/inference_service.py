@@ -2,6 +2,7 @@ import importlib
 import importlib.util
 import json
 import os
+import pickle
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from functools import lru_cache
@@ -68,50 +69,16 @@ def get_pipeline(model_dir: str, verbose: bool) -> NEPSEInferencePipeline:
 
 @dataclass(frozen=True)
 class EnsembleArtifacts:
-    meta: dict[str, Any]
-    feature_cols: list[str]
-    threshold: float
-    direction_classifier: Any
-    regressor: Any
-    momentum_classifier: Any | None
-    scaler: Any | None
-    label_encoder: Any | None
-    fundamentals_lookup: dict[str, dict[str, float | None]]
-    direction_model_path: str
-
-
-def _read_json(path: str) -> dict[str, Any]:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Expected JSON object in '{path}'.")
-    return payload
-
-
-def _read_fundamentals_lookup(path: str | None) -> dict[str, dict[str, float | None]]:
-    if not path:
-        return {}
-    csv_path = Path(path)
-    if not csv_path.exists():
-        return {}
-
-    try:
-        df = pd.read_csv(csv_path)
-    except Exception:
-        return {}
-    if df.empty or "bank" not in df.columns:
-        return {}
-
-    records: dict[str, dict[str, float | None]] = {}
-    for _, row in df.iterrows():
-        bank = str(row.get("bank", "")).strip().upper()
-        if not bank:
-            continue
-        records[bank] = {
-            "car": _to_optional_float_value(row.get("car")),
-            "npl": _to_optional_float_value(row.get("npl")),
-        }
-    return records
+    model_bundle: dict[str, Any]
+    selected_features: list[str]
+    classifier: Any
+    signal_label_encoder: Any | None
+    bank_encoder: Any | None
+    cluster_map: dict[str, int]
+    forward_days: int
+    cv_auc_mean: float | None
+    trained_on: str | None
+    model_path: str
 
 
 def _to_optional_float_value(value: Any) -> float | None:
@@ -129,74 +96,52 @@ def _to_optional_float_value(value: Any) -> float | None:
 
 
 @lru_cache(maxsize=4)
-def get_ensemble_artifacts(
-    meta_path: str,
-    direction_model_path: str,
-    regressor_model_path: str,
-    momentum_model_path: str | None,
-    scaler_model_path: str | None,
-    label_encoder_path: str | None,
-    fundamentals_lookup_path: str | None,
-) -> EnsembleArtifacts:
+def get_ensemble_artifacts(model_path: str) -> EnsembleArtifacts:
+    model_file = Path(model_path)
+    with model_file.open("rb") as handle:
+        model_bundle = pickle.load(handle)
+
+    if not isinstance(model_bundle, dict):
+        raise RuntimeError("Expected a dict artifact in NEPSE model pickle.")
+
+    classifier = model_bundle.get("model")
+    if classifier is None or not hasattr(classifier, "predict") or not hasattr(classifier, "predict_proba"):
+        raise RuntimeError("NEPSE model artifact is missing a classifier with predict/predict_proba.")
+
+    selected_features_raw = model_bundle.get("selected_features")
+    if not isinstance(selected_features_raw, list) or not selected_features_raw:
+        raise RuntimeError("NEPSE model artifact must include non-empty 'selected_features'.")
+    selected_features = [str(item) for item in selected_features_raw]
+
+    cluster_map: dict[str, int] = {}
+    cluster_raw = model_bundle.get("cluster_map")
+    if isinstance(cluster_raw, dict):
+        for key, value in cluster_raw.items():
+            bank = str(key).strip().upper()
+            if not bank:
+                continue
+            try:
+                cluster_map[bank] = int(value)
+            except (TypeError, ValueError):
+                continue
+
+    forward_days = 5
     try:
-        import joblib
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("joblib is required for ensemble inference artifacts.") from exc
+        forward_days = max(int(model_bundle.get("forward_days", 5)), 1)
+    except (TypeError, ValueError):
+        forward_days = 5
 
-    meta = _read_json(meta_path)
-    feature_cols = meta.get("feature_cols") or meta.get("model_features")
-    if not isinstance(feature_cols, list) or not feature_cols:
-        raise RuntimeError(
-            f"Ensemble metadata '{meta_path}' is missing a non-empty feature list."
-        )
-    feature_cols = [str(item) for item in feature_cols]
-    threshold = float(meta.get("threshold", 0.5))
-
-    direction_classifier = joblib.load(direction_model_path)
-    regressor = joblib.load(regressor_model_path)
-
-    if hasattr(direction_classifier, "feature_names_in_"):
-        model_features = [str(item) for item in list(direction_classifier.feature_names_in_)]
-        if model_features:
-            feature_cols = model_features
-
-    if hasattr(regressor, "feature_names_in_"):
-        regressor_features = [str(item) for item in list(regressor.feature_names_in_)]
-        if regressor_features != feature_cols:
-            raise RuntimeError(
-                "Ensemble regressor feature set does not match classifier feature set."
-            )
-
-    momentum_classifier = None
-    if momentum_model_path:
-        loaded = joblib.load(momentum_model_path)
-        if hasattr(loaded, "feature_names_in_"):
-            momentum_features = [str(item) for item in list(loaded.feature_names_in_)]
-            if momentum_features == feature_cols:
-                momentum_classifier = loaded
-        else:
-            momentum_classifier = loaded
-
-    scaler = None
-    if scaler_model_path:
-        scaler = joblib.load(scaler_model_path)
-
-    label_encoder = None
-    if label_encoder_path:
-        label_encoder = joblib.load(label_encoder_path)
-
-    fundamentals_lookup = _read_fundamentals_lookup(fundamentals_lookup_path)
     return EnsembleArtifacts(
-        meta=meta,
-        feature_cols=feature_cols,
-        threshold=threshold,
-        direction_classifier=direction_classifier,
-        regressor=regressor,
-        momentum_classifier=momentum_classifier,
-        scaler=scaler,
-        label_encoder=label_encoder,
-        fundamentals_lookup=fundamentals_lookup,
-        direction_model_path=direction_model_path,
+        model_bundle=model_bundle,
+        selected_features=selected_features,
+        classifier=classifier,
+        signal_label_encoder=model_bundle.get("label_encoder"),
+        bank_encoder=model_bundle.get("bank_encoder"),
+        cluster_map=cluster_map,
+        forward_days=forward_days,
+        cv_auc_mean=_to_optional_float_value(model_bundle.get("cv_auc_mean")),
+        trained_on=str(model_bundle.get("trained_on")) if model_bundle.get("trained_on") else None,
+        model_path=str(model_file.resolve()),
     )
 
 
@@ -204,7 +149,7 @@ class InferenceService:
     def __init__(self, session: Session) -> None:
         self.session = session
         self.autotft_model_dir = os.getenv("MODEL_DIR", "src/tft_artifacts")
-        self.ensemble_model_dir = os.getenv("ENSEMBLE_MODEL_DIR", "models")
+        self.ensemble_model_dir = os.getenv("ENSEMBLE_MODEL_DIR", "src/db/models")
         self.scraper_module = os.getenv("NEPSE_SCRAPER_MODULE", "src.scripts.nepse_scraper")
         self.scraper_function = os.getenv("NEPSE_SCRAPER_FUNCTION", "scrape_market_data")
         self.autotft_model_type = os.getenv("AUTOTFT_MODEL_TYPE", os.getenv("MODEL_TYPE", "autotft"))
@@ -311,6 +256,16 @@ class InferenceService:
         symbol = payload.symbol.strip().upper()
         company = self._get_company_by_symbol(symbol)
         prediction_date = payload.prediction_date or datetime.utcnow().date()
+        minimum_lookback = max(int(os.getenv("ENSEMBLE_MIN_LOOKBACK_DAYS", "520")), 1)
+        if payload.lookback_days < minimum_lookback:
+            if hasattr(payload, "model_copy"):
+                request_payload = payload.model_copy(update={"lookback_days": minimum_lookback})
+            else:
+                request_payload = InferenceRequest(
+                    **{**payload.model_dump(), "lookback_days": minimum_lookback}
+                )
+        else:
+            request_payload = payload
         model_version = self._get_active_model_version(
             model_type=self.ensemble_model_type,
             target=self.ensemble_model_target,
@@ -322,17 +277,22 @@ class InferenceService:
             model_version_id=model_version.id,
             prediction_date=prediction_date,
         )
-        scraped = self._run_scraper(payload)
+        scraped = self._run_scraper(request_payload)
         ohlcv_df, nepse_df = self._build_frames(scraped)
         fundamentals = self._build_fundamentals(
-            payload.fundamentals,
+            request_payload.fundamentals,
             scraped.get("fundamentals", {}),
         )
+        if request_payload.policy_rate is not None:
+            policy_rate = float(request_payload.policy_rate)
+        else:
+            policy_rate = float(scraped.get("policy_rate", POLICY_RATE_FALLBACK))
         artifacts = self._load_ensemble_artifacts()
         feature_df = self._build_ensemble_feature_frame(
             ohlcv_df=ohlcv_df,
             nepse_df=nepse_df,
             fundamentals=fundamentals,
+            policy_rate=policy_rate,
             artifacts=artifacts,
         )
         selected_row = self._build_ensemble_signal_row(
@@ -358,14 +318,14 @@ class InferenceService:
             model_version_id=model_version.id,
             model_type=self.ensemble_model_type,
             model_target=self.ensemble_model_target,
-            model_checkpoint=artifacts.direction_model_path,
+            model_checkpoint=artifacts.model_path,
             data_source=self._resolve_data_source(source_details),
             data_source_details=source_details,
             prediction_date=prediction_date,
             from_cache=cached is not None,
             symbol=symbol,
-            timeframe=payload.timeframe,
-            lookback_days=payload.lookback_days,
+            timeframe=request_payload.timeframe,
+            lookback_days=request_payload.lookback_days,
             generated_at=datetime.utcnow(),
             rows_ohlcv=len(ohlcv_df),
             rows_nepse=len(nepse_df),
@@ -399,22 +359,71 @@ class InferenceService:
             .all()
         )
         db_symbols = [str(row[0]).strip().upper() for row in from_db if row[0]]
+        commercial_companies = self.list_commercial_bank_companies()
+        commercial_symbols = [
+            str(item.get("symbol", "")).strip().upper()
+            for item in commercial_companies
+            if str(item.get("symbol", "")).strip()
+        ]
 
         try:
             module = importlib.import_module(self.scraper_module)
         except ModuleNotFoundError:
-            return sorted(set(db_symbols))
+            return sorted(set(db_symbols) | set(commercial_symbols))
 
         get_symbols = getattr(module, "list_supported_symbols", None)
         if not callable(get_symbols):
-            return sorted(set(db_symbols))
+            return sorted(set(db_symbols) | set(commercial_symbols))
 
         try:
             scraper_symbols = [str(item).strip().upper() for item in get_symbols() if str(item).strip()]
         except Exception:
             scraper_symbols = []
 
-        return sorted(set(db_symbols) | set(scraper_symbols))
+        return sorted(set(db_symbols) | set(scraper_symbols) | set(commercial_symbols))
+
+    def list_commercial_bank_companies(self) -> list[dict[str, Any]]:
+        try:
+            module = importlib.import_module(self.scraper_module)
+        except ModuleNotFoundError:
+            module = None
+
+        if module is not None:
+            fetch_companies = getattr(module, "list_commercial_bank_companies", None)
+            if callable(fetch_companies):
+                try:
+                    rows = fetch_companies()
+                    if isinstance(rows, list):
+                        return [item for item in rows if isinstance(item, dict)]
+                except Exception:
+                    pass
+
+        # Fallback for dropdown continuity when remote API is unavailable.
+        companies = (
+            self.session.query(Company)
+            .filter(
+                Company.is_active.is_(True),
+                func.lower(Company.sector) == "commercial banks",
+            )
+            .order_by(Company.symbol.asc())
+            .all()
+        )
+        return [
+            {
+                "id": int(company.company_id),
+                "companyName": company.company_name,
+                "symbol": company.symbol,
+                "securityName": company.company_name,
+                "status": "A" if bool(company.is_active) else "I",
+                "companyEmail": None,
+                "website": None,
+                "sectorName": company.sector,
+                "regulatoryBody": None,
+                "instrumentType": "Equity",
+            }
+            for company in companies
+            if company.symbol
+        ]
 
     def activate_model_version(self, model_version_id: int) -> ModelVersion:
         model_version = self.session.query(ModelVersion).filter(ModelVersion.id == model_version_id).first()
@@ -599,48 +608,12 @@ class InferenceService:
         return None
 
     def _load_ensemble_artifacts(self) -> EnsembleArtifacts:
-        meta_path = self._resolve_ensemble_path(
-            env_var="ENSEMBLE_META_PATH",
-            defaults=["model_meta.json"],
-        )
-        direction_model_path = self._resolve_ensemble_path(
-            env_var="ENSEMBLE_DIRECTION_MODEL_PATH",
-            defaults=["direction_classifier.pkl", "model_clf_dir.pkl"],
-        )
-        regressor_model_path = self._resolve_ensemble_path(
-            env_var="ENSEMBLE_REGRESSOR_MODEL_PATH",
-            defaults=["return_regressor.pkl", "model_reg_mag.pkl"],
-        )
-        momentum_model_path = self._resolve_ensemble_path(
-            env_var="ENSEMBLE_MOMENTUM_MODEL_PATH",
-            defaults=["model_clf_mom.pkl"],
-            required=False,
-        )
-        scaler_model_path = self._resolve_ensemble_path(
-            env_var="ENSEMBLE_SCALER_MODEL_PATH",
-            defaults=["model_scaler.pkl"],
-            required=False,
-        )
-        label_encoder_path = self._resolve_ensemble_path(
-            env_var="ENSEMBLE_LABEL_ENCODER_PATH",
-            defaults=["label_encoder.pkl"],
-            required=False,
-        )
-        fundamentals_lookup_path = self._resolve_ensemble_path(
-            env_var="ENSEMBLE_FUNDAMENTALS_LOOKUP_PATH",
-            defaults=["fundamental_lookup.csv"],
-            required=False,
+        model_path = self._resolve_ensemble_path(
+            env_var="ENSEMBLE_MODEL_PATH",
+            defaults=["nepse_model.pkl", "src/db/models/nepse_model.pkl"],
         )
         try:
-            return get_ensemble_artifacts(
-                meta_path=meta_path,
-                direction_model_path=direction_model_path,
-                regressor_model_path=regressor_model_path,
-                momentum_model_path=momentum_model_path,
-                scaler_model_path=scaler_model_path,
-                label_encoder_path=label_encoder_path,
-                fundamentals_lookup_path=fundamentals_lookup_path,
-            )
+            return get_ensemble_artifacts(model_path=model_path)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Failed to load ensemble artifacts: {exc}") from exc
 
@@ -675,67 +648,71 @@ class InferenceService:
 
     def _prepare_nepse_for_ensemble(self, nepse_df: pd.DataFrame, ohlcv_df: pd.DataFrame) -> pd.DataFrame:
         if nepse_df.empty:
-            np_df = pd.DataFrame()
+            np_df = pd.DataFrame(columns=["date", "nepse_close"])
         else:
             np_df = nepse_df.copy()
+            if "date" in np_df.columns:
+                np_df["date"] = pd.to_datetime(np_df["date"], errors="coerce")
+            else:
+                np_df["date"] = pd.NaT
 
-        if not np_df.empty and "date" in np_df.columns:
-            np_df["date"] = pd.to_datetime(np_df["date"], errors="coerce")
-        else:
-            np_df = pd.DataFrame(columns=["date", "nepse_close"])
+            if "nepse_close" in np_df.columns:
+                np_df["nepse_close"] = pd.to_numeric(np_df["nepse_close"], errors="coerce")
+            elif "close" in np_df.columns:
+                np_df["nepse_close"] = pd.to_numeric(np_df["close"], errors="coerce")
+            else:
+                np_df["nepse_close"] = np.nan
 
-        if "nepse_close" not in np_df.columns:
-            close_column = "close" if "close" in np_df.columns else None
-            if close_column:
-                np_df["nepse_close"] = pd.to_numeric(np_df[close_column], errors="coerce")
+            np_df = np_df[["date", "nepse_close"]]
 
-        np_df = np_df.dropna(subset=["date", "nepse_close"]) if not np_df.empty else np_df
-        np_df = (
-            np_df.sort_values("date")
-            .drop_duplicates(subset=["date"], keep="last")
-            .reset_index(drop=True)
-        )
+        np_df = np_df.dropna(subset=["date", "nepse_close"])
+        np_df = np_df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
 
         if np_df.empty:
-            fallback = (
+            np_df = (
                 ohlcv_df.groupby("date", as_index=False)["close"]
                 .mean()
                 .rename(columns={"close": "nepse_close"})
             )
-            np_df = fallback
 
-        np_df["nepse_ret_1d"] = np_df["nepse_close"].pct_change()
-        np_df["nepse_ma_50"] = np_df["nepse_close"].rolling(50, min_periods=5).mean()
-        np_df["nepse_bull"] = (np_df["nepse_close"] >= np_df["nepse_ma_50"]).astype(float)
-        np_df["nepse_ret_1d"] = np_df["nepse_ret_1d"].replace([np.inf, -np.inf], np.nan)
-        return np_df[["date", "nepse_ret_1d", "nepse_bull"]]
+        np_df = np_df.sort_values("date").reset_index(drop=True)
+        np_df["nepse_close"] = np_df["nepse_close"].ffill().bfill()
+        close = np_df["nepse_close"]
+        np_df["nepse_ret_1d"] = np.log(close / close.shift(1))
+        np_df["nepse_ret_5d"] = np.log(close / close.shift(5))
+        np_df["nepse_ret_21d"] = np.log(close / close.shift(21))
+        np_df = np_df.replace([np.inf, -np.inf], np.nan)
+        return np_df[["date", "nepse_close", "nepse_ret_1d", "nepse_ret_5d", "nepse_ret_21d"]]
 
-    def _encode_bank_value(self, bank: str, artifacts: EnsembleArtifacts) -> float:
-        if artifacts.label_encoder is not None and hasattr(artifacts.label_encoder, "classes_"):
-            classes = [str(item).strip().upper() for item in list(artifacts.label_encoder.classes_)]
-            if bank in classes:
-                return float(artifacts.label_encoder.transform([bank])[0])
+    def _encode_bank_feature(self, bank: str, artifacts: EnsembleArtifacts) -> int:
+        encoder = artifacts.bank_encoder
+        if encoder is None or not hasattr(encoder, "classes_") or not hasattr(encoder, "transform"):
+            return -1
 
-        meta_classes = artifacts.meta.get("bank_classes")
-        if isinstance(meta_classes, list):
-            normalized = [str(item).strip().upper() for item in meta_classes]
-            if bank in normalized:
-                return float(normalized.index(bank))
-
-        return float("nan")
+        classes = {str(item).strip().upper() for item in list(encoder.classes_)}
+        if bank not in classes:
+            return -1
+        try:
+            return int(encoder.transform([bank])[0])
+        except Exception:
+            return -1
 
     def _build_ensemble_feature_frame(
         self,
         ohlcv_df: pd.DataFrame,
         nepse_df: pd.DataFrame,
         fundamentals: dict[str, dict[str, float | None]],
+        policy_rate: float,
         artifacts: EnsembleArtifacts,
     ) -> pd.DataFrame:
         df = self._prepare_ohlcv_for_ensemble(ohlcv_df)
         nepse = self._prepare_nepse_for_ensemble(nepse_df, df)
         df = df.merge(nepse, on="date", how="left")
-        df["nepse_ret_1d"] = df["nepse_ret_1d"].ffill().bfill().fillna(0.0)
-        df["nepse_bull"] = df["nepse_bull"].ffill().bfill().fillna(0.0)
+        df["nepse_close"] = df["nepse_close"].ffill().bfill()
+        df["nepse_ret_1d"] = df["nepse_ret_1d"].ffill().bfill()
+        df["nepse_ret_5d"] = df["nepse_ret_5d"].ffill().bfill()
+        df["nepse_ret_21d"] = df["nepse_ret_21d"].ffill().bfill()
+        df["policy_rate"] = float(policy_rate)
 
         default_car = float(os.getenv("NEPSE_DEFAULT_CAR", 12.0))
         default_npl = float(os.getenv("NEPSE_DEFAULT_NPL", 2.0))
@@ -746,11 +723,6 @@ class InferenceService:
                 value = _to_optional_float_value(scoped.get("car"))
                 if value is not None:
                     return value
-            lookup = artifacts.fundamentals_lookup.get(bank)
-            if isinstance(lookup, dict):
-                value = _to_optional_float_value(lookup.get("car"))
-                if value is not None:
-                    return value
             return default_car
 
         def npl_for(bank: str) -> float:
@@ -759,68 +731,119 @@ class InferenceService:
                 value = _to_optional_float_value(scoped.get("npl"))
                 if value is not None:
                     return value
-            lookup = artifacts.fundamentals_lookup.get(bank)
-            if isinstance(lookup, dict):
-                value = _to_optional_float_value(lookup.get("npl"))
-                if value is not None:
-                    return value
             return default_npl
 
         df["car"] = df["bank"].map(car_for).astype(float)
         df["npl"] = df["bank"].map(npl_for).astype(float)
 
-        df["ret_raw"] = df.groupby("bank")["close"].pct_change()
-        sector_ret = (
-            df.groupby("date", as_index=False)["ret_raw"]
-            .mean()
-            .rename(columns={"ret_raw": "sector_ret"})
-        )
-        df = df.merge(sector_ret, on="date", how="left")
-
         groups: list[pd.DataFrame] = []
         for bank_name, group in df.groupby("bank", sort=False):
             g = group.sort_values("date").copy()
             c = g["close"]
-            ret = c.pct_change()
+            h = g["high"]
+            lo = g["low"]
+            v = g["volume"]
+            o = g["open"]
+            nc = g["nepse_close"]
 
-            g["ret_lag1"] = ret.shift(1)
-            g["ret_3d_lag1"] = ret.rolling(3, min_periods=3).sum().shift(1)
+            g["log_ret_1d"] = np.log(c / c.shift(1))
+            g["log_ret_3d"] = np.log(c / c.shift(3))
+            g["log_ret_5d"] = np.log(c / c.shift(5))
+            g["log_ret_10d"] = np.log(c / c.shift(10))
+            g["log_ret_21d"] = np.log(c / c.shift(21))
 
-            ma20 = c.rolling(20, min_periods=20).mean()
-            std20 = c.rolling(20, min_periods=20).std()
-            g["bb_pct_lag1"] = ((c - (ma20 - (2 * std20))) / ((4 * std20) + 1e-9)).shift(1)
+            g["sma_5"] = c.rolling(5).mean()
+            g["sma_21"] = c.rolling(21).mean()
+            g["sma_63"] = c.rolling(63).mean()
+            g["ema_9"] = c.ewm(span=9, adjust=False).mean()
+            g["ema_21"] = c.ewm(span=21, adjust=False).mean()
 
-            lo14 = g["low"].rolling(14, min_periods=14).min()
-            hi14 = g["high"].rolling(14, min_periods=14).max()
-            g["stoch_k_lag1"] = ((c - lo14) / ((hi14 - lo14) + 1e-9) * 100.0).shift(1)
+            g["price_to_sma5"] = c / g["sma_5"] - 1
+            g["price_to_sma21"] = c / g["sma_21"] - 1
+            g["price_to_sma63"] = c / g["sma_63"] - 1
+            g["sma5_to_sma21"] = g["sma_5"] / g["sma_21"] - 1
+            g["sma21_to_sma63"] = g["sma_21"] / g["sma_63"] - 1
+
+            delta = c.diff()
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss = (-delta.clip(upper=0)).rolling(14).mean()
+            g["rsi_14"] = 100 - (100 / (1 + gain / (loss + 1e-9)))
+
+            gain2 = delta.clip(lower=0).rolling(28).mean()
+            loss2 = (-delta.clip(upper=0)).rolling(28).mean()
+            g["rsi_28"] = 100 - (100 / (1 + gain2 / (loss2 + 1e-9)))
+
+            ema12 = c.ewm(span=12, adjust=False).mean()
+            ema26 = c.ewm(span=26, adjust=False).mean()
+            macd = ema12 - ema26
+            macd_signal = macd.ewm(span=9, adjust=False).mean()
+            g["macd_norm"] = macd / (c + 1e-9)
+            g["macd_hist_norm"] = (macd - macd_signal) / (c + 1e-9)
+
+            g["roc_5"] = c.pct_change(5)
+            g["roc_21"] = c.pct_change(21)
+
+            g["vol_21"] = g["log_ret_1d"].rolling(21).std()
+            g["vol_63"] = g["log_ret_1d"].rolling(63).std()
+            g["vol_ratio"] = g["vol_21"] / (g["vol_63"] + 1e-9)
 
             tr = pd.concat(
                 [
-                    g["high"] - g["low"],
-                    (g["high"] - c.shift(1)).abs(),
-                    (g["low"] - c.shift(1)).abs(),
+                    h - lo,
+                    (h - c.shift(1)).abs(),
+                    (lo - c.shift(1)).abs(),
                 ],
                 axis=1,
             ).max(axis=1)
-            g["atr_ratio_lag1"] = (tr.rolling(14, min_periods=14).mean() / c.replace(0, np.nan)).shift(1)
+            g["atr_14_norm"] = tr.rolling(14).mean() / (c + 1e-9)
 
-            vol_5 = ret.rolling(5, min_periods=5).std()
-            vol_21 = ret.rolling(21, min_periods=21).std()
-            g["vol_ratio_5_21"] = vol_5 / (vol_21 + 1e-9)
+            bb_mid = c.rolling(20).mean()
+            bb_std = c.rolling(20).std()
+            g["bb_width"] = (2 * bb_std) / (bb_mid + 1e-9)
+            g["bb_pct"] = (c - (bb_mid - 2 * bb_std)) / (4 * bb_std + 1e-9)
 
-            ma21 = c.rolling(21, min_periods=21).mean()
-            g["close_to_ma21"] = (c / ma21) - 1.0
+            g["hl_ratio"] = (h - lo) / (c + 1e-9)
+            g["co_ratio"] = (c - o) / (h - lo + 1e-9)
+            g["upper_shadow"] = (h - np.maximum(o, c)) / (h - lo + 1e-9)
+            g["lower_shadow"] = (np.minimum(o, c) - lo) / (h - lo + 1e-9)
 
-            lo252 = c.rolling(252, min_periods=60).min()
-            g["dist_52w_low"] = (c / lo252) - 1.0
+            v_ma20 = v.rolling(20).mean()
+            g["vol_ratio_20"] = v / (v_ma20 + 1e-9)
+            g["vol_ma5_ma20"] = v.rolling(5).mean() / (v_ma20 + 1e-9)
 
-            vol_ma21 = g["volume"].rolling(21, min_periods=5).mean()
-            g["vol_surge_lag1"] = (g["volume"] / vol_ma21.replace(0, np.nan)).shift(1)
+            obv = (np.sign(g["log_ret_1d"]) * v).cumsum()
+            obv_std = obv.rolling(21).std()
+            g["obv_momentum"] = obv.diff(5) / (obv_std + 1e-9)
+            g["pv_divergence"] = g["log_ret_5d"] * (1 - g["vol_ratio_20"])
 
-            g["sector_ret_lag1"] = g["sector_ret"].shift(1)
-            g["nepse_ret_lag1"] = g["nepse_ret_1d"].shift(1)
-            g["month"] = g["date"].dt.month.astype(float)
-            g["bank_enc"] = self._encode_bank_value(bank_name, artifacts)
+            g["pct_from_52w_high"] = c / c.rolling(252, min_periods=60).max() - 1
+            g["pct_from_52w_low"] = c / c.rolling(252, min_periods=60).min() - 1
+
+            nepse_ret_1d = np.log(nc / nc.shift(1))
+            g["alpha_1d"] = g["log_ret_1d"] - nepse_ret_1d
+            g["alpha_5d"] = g["log_ret_5d"] - g["nepse_ret_5d"]
+            g["alpha_21d"] = g["log_ret_21d"] - g["nepse_ret_21d"]
+            g["nepse_bull_derived"] = (nc.rolling(21).mean() > nc.rolling(63).mean()).astype(int)
+
+            g["month"] = g["date"].dt.month
+            g["quarter"] = g["date"].dt.quarter
+            g["day_of_week"] = g["date"].dt.dayofweek
+            g["fiscal_q"] = ((g["date"].dt.month - 7) % 12 // 3 + 1)
+            g["covid_regime"] = (
+                (g["date"] >= "2020-02-01")
+                & (g["date"] <= "2021-12-31")
+            ).astype(int)
+            g["high_rate_regime"] = (g["policy_rate"] >= 5.5).astype(int)
+
+            g["close_zscore_63"] = (c - c.rolling(63).mean()) / (c.rolling(63).std() + 1e-9)
+            g["vol_zscore_63"] = (v - v.rolling(63).mean()) / (v.rolling(63).std() + 1e-9)
+
+            g["policy_rate_chg"] = g["policy_rate"].diff().fillna(0.0)
+            g["car_chg"] = g["car"].diff().fillna(0.0)
+            g["npl_chg"] = g["npl"].diff().fillna(0.0)
+
+            g["bank_enc"] = self._encode_bank_feature(bank_name, artifacts)
+            g["bank_cluster"] = int(artifacts.cluster_map.get(bank_name, -1))
 
             groups.append(g)
 
@@ -828,27 +851,36 @@ class InferenceService:
         engineered = engineered.replace([np.inf, -np.inf], np.nan)
         return engineered.sort_values(["bank", "date"]).reset_index(drop=True)
 
-    def _predict_probability_from_classifier(self, model: Any, features: pd.DataFrame) -> float:
-        if hasattr(model, "predict_proba"):
-            probabilities = model.predict_proba(features)
-            if probabilities.ndim != 2 or probabilities.shape[0] == 0:
-                raise HTTPException(status_code=500, detail="Classifier returned invalid probability shape.")
-            if probabilities.shape[1] == 1:
-                return float(np.clip(probabilities[0][0], 0.0, 1.0))
+    def _prob_for_class(
+        self,
+        labels: list[str],
+        probabilities: np.ndarray,
+        target_class: str,
+    ) -> float:
+        normalized = [item.strip().lower() for item in labels]
+        target = target_class.strip().lower()
+        if target not in normalized:
+            return 0.0
+        idx = normalized.index(target)
+        return float(np.clip(probabilities[idx], 0.0, 1.0))
 
-            if hasattr(model, "classes_"):
-                classes = list(model.classes_)
-                if 1 in classes:
-                    index = classes.index(1)
-                    return float(np.clip(probabilities[0][index], 0.0, 1.0))
-            return float(np.clip(probabilities[0][-1], 0.0, 1.0))
+    def _estimate_return_from_class_probs(
+        self,
+        history_close: pd.Series,
+        prob_buy: float,
+        prob_hold: float,
+        prob_sell: float,
+        forward_days: int,
+    ) -> float:
+        trailing = np.log(history_close / history_close.shift(forward_days)).dropna()
+        if trailing.empty:
+            return (prob_buy - prob_sell) * 0.01
 
-        if hasattr(model, "decision_function"):
-            logits = model.decision_function(features)
-            value = float(np.ravel(logits)[0])
-            return float(1.0 / (1.0 + np.exp(-value)))
-
-        raise HTTPException(status_code=500, detail="Classifier does not expose predict_proba/decision_function.")
+        buy_thr = float(np.percentile(trailing, 70))
+        sell_thr = float(np.percentile(trailing, 30))
+        hold_level = float(np.median(trailing))
+        expected_log_ret = (prob_buy * buy_thr) + (prob_hold * hold_level) + (prob_sell * sell_thr)
+        return float(np.expm1(expected_log_ret))
 
     def _build_ensemble_signal_row(
         self,
@@ -860,54 +892,76 @@ class InferenceService:
         if bank_rows.empty:
             raise HTTPException(status_code=404, detail=f"No feature rows available for symbol '{symbol}'.")
 
-        for column in artifacts.feature_cols:
+        for column in artifacts.selected_features:
             if column not in bank_rows.columns:
                 raise HTTPException(
                     status_code=500,
                     detail=f"Ensemble feature column '{column}' is missing from engineered frame.",
                 )
 
-        usable = bank_rows.dropna(subset=artifacts.feature_cols)
+        usable = bank_rows.dropna(subset=artifacts.selected_features)
+        nan_features: list[str] | None = None
         if usable.empty:
-            latest = bank_rows.iloc[-1]
-            missing = [col for col in artifacts.feature_cols if pd.isna(latest.get(col))]
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Not enough history to build ensemble features for '{symbol}'. "
-                    f"Missing in latest row: {missing}"
-                ),
+            latest = bank_rows.iloc[-1].copy()
+            feature_values = latest[artifacts.selected_features].copy()
+            nan_features = [
+                column for column in artifacts.selected_features if pd.isna(feature_values.get(column))
+            ]
+            for column in nan_features:
+                bank_series = bank_rows[column].dropna()
+                if not bank_series.empty:
+                    feature_values[column] = bank_series.iloc[-1]
+                    continue
+
+                global_series = feature_df[column].dropna()
+                if not global_series.empty:
+                    feature_values[column] = float(global_series.median())
+                else:
+                    feature_values[column] = 0.0
+            features = pd.DataFrame([feature_values], columns=artifacts.selected_features)
+        else:
+            latest = usable.iloc[-1]
+            features = usable.tail(1)[artifacts.selected_features]
+        probabilities = np.asarray(artifacts.classifier.predict_proba(features))[0]
+
+        if artifacts.signal_label_encoder is not None and hasattr(
+            artifacts.signal_label_encoder, "classes_"
+        ):
+            labels = [str(item) for item in list(artifacts.signal_label_encoder.classes_)]
+            predicted_label = str(
+                artifacts.signal_label_encoder.inverse_transform(
+                    np.asarray(artifacts.classifier.predict(features))
+                )[0]
             )
-
-        latest = usable.iloc[-1]
-        features = usable.tail(1)[artifacts.feature_cols]
-
-        prob_direction = self._predict_probability_from_classifier(artifacts.direction_classifier, features)
-        predicted_return_raw = float(np.ravel(artifacts.regressor.predict(features))[0])
-        if abs(predicted_return_raw) > 1.0:
-            return_magnitude = predicted_return_raw / 100.0
+        elif hasattr(artifacts.classifier, "classes_"):
+            labels = [str(item) for item in list(artifacts.classifier.classes_)]
+            predicted_label = str(labels[int(np.argmax(probabilities))])
         else:
-            return_magnitude = predicted_return_raw
-        predicted_mag = return_magnitude * 100.0
+            labels = ["Buy", "Hold", "Sell"]
+            predicted_label = labels[int(np.argmax(probabilities))]
 
-        if artifacts.momentum_classifier is not None:
-            prob_momentum = self._predict_probability_from_classifier(artifacts.momentum_classifier, features)
-        else:
-            prob_momentum = prob_direction
+        prob_buy = self._prob_for_class(labels, probabilities, "Buy")
+        prob_hold = self._prob_for_class(labels, probabilities, "Hold")
+        prob_sell = self._prob_for_class(labels, probabilities, "Sell")
 
-        if artifacts.scaler is not None:
-            try:
-                mag_norm = float(np.ravel(artifacts.scaler.transform([[predicted_return_raw]]))[0])
-                model_score = (0.6 * prob_direction) + (0.4 * mag_norm)
-            except Exception:
-                model_score = (0.6 * prob_direction) + (0.4 * prob_momentum)
-        else:
-            model_score = (0.6 * prob_direction) + (0.4 * prob_momentum)
-        model_score = float(np.clip(model_score, 0.0, 1.0))
+        prob_direction = float(np.clip(prob_buy, 0.0, 1.0))
+        prob_momentum = prob_direction
+        model_score = float(np.clip(float(np.max(probabilities)), 0.0, 1.0))
+        return_magnitude = self._estimate_return_from_class_probs(
+            history_close=bank_rows["close"],
+            prob_buy=prob_buy,
+            prob_hold=prob_hold,
+            prob_sell=prob_sell,
+            forward_days=artifacts.forward_days,
+        )
+        predicted_mag = float(return_magnitude * 100.0)
 
-        threshold = artifacts.threshold
+        threshold = float(os.getenv("ENSEMBLE_SIGNAL_THRESHOLD", "0.5"))
+        raw_signal = "UP" if predicted_label.strip().lower() == "buy" else "DOWN"
+        if predicted_label.strip().lower() == "hold":
+            raw_signal = "UP" if prob_buy >= prob_sell else "DOWN"
         direction = self._normalize_signal(
-            raw_signal=None,
+            raw_signal=raw_signal,
             prob_up=prob_direction,
             predicted_mag=predicted_mag,
             threshold=threshold,
@@ -932,7 +986,7 @@ class InferenceService:
             "confidence": confidence,
             "signal_strength": signal_strength,
             "threshold_used": float(threshold),
-            "nan_features": None,
+            "nan_features": nan_features,
             "car": _to_optional_float_value(latest.get("car")),
             "npl": _to_optional_float_value(latest.get("npl")),
             "forecast_next_5d": None,
@@ -1112,30 +1166,18 @@ class InferenceService:
 
     def _create_ensemble_model_version_from_meta(self, model_type: str, target: str) -> ModelVersion:
         artifacts = self._load_ensemble_artifacts()
-        meta = artifacts.meta
-        metrics = meta.get("metrics", {}) if isinstance(meta.get("metrics"), dict) else {}
-        features = artifacts.feature_cols
+        features = artifacts.selected_features
 
-        trained_at = self._parse_datetime(meta.get("trained_at")) or datetime.utcnow()
-        train_end_value = meta.get("train_end") or meta.get("train_cutoff") or meta.get("split_date")
-        train_end_date = self._parse_date(train_end_value) or datetime.utcnow().date()
+        trained_at = self._parse_datetime(artifacts.trained_on)
+        if trained_at is None:
+            trained_date = self._parse_date(artifacts.trained_on)
+            if trained_date is not None:
+                trained_at = datetime.combine(trained_date, time.min)
+        if trained_at is None:
+            trained_at = datetime.utcnow()
 
-        train_auc = self._to_optional_float(meta.get("tr_auc_ens"))
-        if train_auc is None:
-            train_auc = self._to_optional_float(metrics.get("tr_auc_ens"))
-        if train_auc is None:
-            train_auc = self._to_optional_float(metrics.get("tr_auc_dir"))
-
-        test_auc = self._to_optional_float(meta.get("te_auc_ens"))
-        if test_auc is None:
-            test_auc = self._to_optional_float(metrics.get("te_auc_ens"))
-        if test_auc is None:
-            test_auc = self._to_optional_float(meta.get("cv_mean_auc"))
-        if test_auc is None:
-            test_auc = self._to_optional_float(metrics.get("te_auc_dir"))
-
-        train_r2 = self._to_optional_float(metrics.get("tr_r2"))
-        test_r2 = self._to_optional_float(metrics.get("te_r2"))
+        train_end_date = self._parse_date(artifacts.trained_on) or datetime.utcnow().date()
+        test_auc = artifacts.cv_auc_mean
 
         self._deactivate_versions(model_type=model_type, target=target)
         model_version = ModelVersion(
@@ -1144,12 +1186,12 @@ class InferenceService:
             trained_at=trained_at,
             train_end_date=train_end_date,
             n_features=len(features),
-            train_auc=train_auc,
+            train_auc=None,
             test_auc=test_auc,
-            train_r2=train_r2,
-            test_r2=test_r2,
+            train_r2=None,
+            test_r2=None,
             feature_list=json.dumps(features),
-            notes="Auto-created from ensemble artifact metadata.",
+            notes="Auto-created from NEPSE HistGradient artifact metadata.",
             is_active=True,
         )
         self.session.add(model_version)
@@ -1452,9 +1494,8 @@ class InferenceService:
 
     def _current_threshold(self) -> float:
         try:
-            pipeline = get_pipeline(self.autotft_model_dir, self.pipeline_verbose)
-            threshold = float(getattr(pipeline, "threshold", 0.5))
-        except Exception:
+            threshold = float(os.getenv("ENSEMBLE_SIGNAL_THRESHOLD", "0.5"))
+        except ValueError:
             threshold = 0.5
         return threshold
 

@@ -13,6 +13,8 @@ import pandas as pd
 
 URL_TEMPLATE_ENV = "NEPSE_PRICE_VOLUME_URL_TEMPLATE"
 DEFAULT_URL_TEMPLATE = "http://127.0.0.1:8000/PriceVolumeHistory?symbol={symbol}"
+COMPANY_LIST_URL_ENV = "NEPSE_COMPANY_LIST_URL"
+DEFAULT_COMPANY_LIST_URL = "http://127.0.0.1:8000/CompanyList"
 LOCAL_HOSTS = ("0.0.0.0", "127.0.0.1", "localhost", "host.docker.internal")
 LOCAL_BANK_DATA_DIR_ENV = "NEPSE_LOCAL_BANK_DATA_DIR"
 DEFAULT_LOCAL_BANK_DATA_DIR = "data/raw"
@@ -92,7 +94,8 @@ def scrape_market_data(symbol: str, timeframe: str = "1d", lookback_days: int = 
 def list_supported_symbols() -> list[str]:
     configured = Path(os.getenv(LOCAL_BANK_DATA_DIR_ENV, DEFAULT_LOCAL_BANK_DATA_DIR))
     candidates = [configured, Path(DEFAULT_LOCAL_BANK_DATA_DIR)]
-    symbols: set[str] = set(_load_active_banks_from_meta())
+    symbols: set[str] = {item["symbol"] for item in list_commercial_bank_companies()}
+    symbols.update(_load_active_banks_from_meta())
 
     seen_paths: set[Path] = set()
     for directory in candidates:
@@ -105,6 +108,70 @@ def list_supported_symbols() -> list[str]:
                 symbols.add(csv_path.stem.strip().upper())
 
     return sorted(symbols)
+
+
+def list_commercial_bank_companies() -> list[dict[str, Any]]:
+    timeout = _get_env_float("NEPSE_API_TIMEOUT_SECONDS", 15.0)
+    rows: list[dict[str, Any]] = []
+
+    for url in _candidate_company_list_urls():
+        try:
+            request = Request(
+                url=url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "ml-ete-nepse-scraper/1.0",
+                },
+            )
+            with urlopen(request, timeout=timeout) as response:  # noqa: S310
+                body = response.read().decode("utf-8")
+            payload = json.loads(body)
+        except Exception:  # noqa: BLE001
+            continue
+
+        parsed_rows = _extract_list_payload(payload)
+        if parsed_rows is None and isinstance(payload, list):
+            parsed_rows = [item for item in payload if isinstance(item, dict)]
+        if not parsed_rows:
+            continue
+        rows = parsed_rows
+        break
+
+    if not rows:
+        return []
+
+    companies_by_symbol: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        sector = str(row.get("sectorName", "")).strip().lower()
+        if sector != "commercial banks":
+            continue
+
+        instrument_type = str(row.get("instrumentType", "")).strip().lower()
+        if instrument_type and instrument_type != "equity":
+            continue
+
+        symbol = str(row.get("symbol", "")).strip().upper()
+        if not symbol:
+            continue
+
+        status = str(row.get("status", "")).strip().upper()
+        if status and status not in {"A", "ACTIVE"}:
+            continue
+
+        companies_by_symbol[symbol] = {
+            "id": row.get("id"),
+            "companyName": row.get("companyName") or row.get("securityName") or symbol,
+            "symbol": symbol,
+            "securityName": row.get("securityName"),
+            "status": row.get("status"),
+            "companyEmail": row.get("companyEmail"),
+            "website": row.get("website"),
+            "sectorName": row.get("sectorName"),
+            "regulatoryBody": row.get("regulatoryBody"),
+            "instrumentType": row.get("instrumentType"),
+        }
+
+    return [companies_by_symbol[symbol] for symbol in sorted(companies_by_symbol)]
 
 
 def _resolve_symbols_to_fetch(target_symbol: str) -> list[str]:
@@ -282,6 +349,30 @@ def _candidate_urls(symbol: str) -> list[str]:
             if alt and alt not in candidates:
                 candidates.append(alt)
 
+    return candidates
+
+
+def _candidate_company_list_urls() -> list[str]:
+    configured = os.getenv(COMPANY_LIST_URL_ENV, "").strip()
+    if configured:
+        primary = configured
+    else:
+        template = os.getenv(URL_TEMPLATE_ENV, DEFAULT_URL_TEMPLATE).strip()
+        parsed = urlparse(template)
+        primary = urlunparse(parsed._replace(path="/CompanyList", query="", params="", fragment=""))
+        if not primary:
+            primary = DEFAULT_COMPANY_LIST_URL
+
+    candidates = [primary]
+    parsed = urlparse(primary)
+    host = (parsed.hostname or "").lower()
+    if host in LOCAL_HOSTS:
+        for fallback_host in LOCAL_HOSTS:
+            if fallback_host == host:
+                continue
+            alt = _replace_url_host(primary, fallback_host)
+            if alt and alt not in candidates:
+                candidates.append(alt)
     return candidates
 
 

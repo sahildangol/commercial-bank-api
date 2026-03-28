@@ -1,4 +1,5 @@
 from datetime import date
+from typing import Any
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
@@ -34,6 +35,15 @@ def predict_symbol_signal_advanced(payload: InferenceRequest, session: Session =
 @inferenceRouter.get("/supported-symbols", status_code=200, response_model=list[str])
 def list_supported_symbols(session: Session = Depends(get_db)):
     return InferenceService(session=session).list_supported_symbols()
+
+
+@inferenceRouter.get(
+    "/companies/commercial-banks",
+    status_code=200,
+    response_model=list[dict[str, Any]],
+)
+def list_commercial_bank_companies(session: Session = Depends(get_db)):
+    return InferenceService(session=session).list_commercial_bank_companies()
 
 
 @inferenceRouter.post("/model-versions", status_code=201, response_model=ModelVersionResponse)
