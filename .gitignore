@@ -12,6 +12,7 @@ notebooks/*.pyc
 notebooks/*.pyd
 output/
 .env
+!.env.sample
 *.pyc
 src/model/autotft/archive/
 

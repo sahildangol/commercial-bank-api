@@ -25,14 +25,22 @@ FORCE_ACTIVE_BANK_CONTEXT_ENV = "NEPSE_FORCE_ACTIVE_BANK_CONTEXT"
 PREFER_LOCAL_DATA_ENV = "NEPSE_PREFER_LOCAL_DATA"
 
 
-def scrape_market_data(symbol: str, timeframe: str = "1d", lookback_days: int = 320):
+def scrape_market_data(
+    symbol: str,
+    timeframe: str = "1d",
+    lookback_days: int = 320,
+    include_active_context: bool = False,
+):
     target_symbol = symbol.strip().upper()
     if not target_symbol:
         raise ValueError("symbol is required.")
     if timeframe != "1d":
         raise ValueError("Only timeframe='1d' is currently supported.")
 
-    symbols_to_fetch = _resolve_symbols_to_fetch(target_symbol)
+    symbols_to_fetch = _resolve_symbols_to_fetch(
+        target_symbol,
+        include_active_context=include_active_context,
+    )
     histories: dict[str, list[dict[str, Any]]] = {}
     sources: dict[str, dict[str, str | None]] = {}
     optional_errors: list[str] = []
@@ -174,12 +182,14 @@ def list_commercial_bank_companies() -> list[dict[str, Any]]:
     return [companies_by_symbol[symbol] for symbol in sorted(companies_by_symbol)]
 
 
-def _resolve_symbols_to_fetch(target_symbol: str) -> list[str]:
+def _resolve_symbols_to_fetch(target_symbol: str, include_active_context: bool = False) -> list[str]:
     symbols = [target_symbol]
     fetch_all_active = _is_truthy(os.getenv(FETCH_ALL_ACTIVE_BANKS_ENV, "false"))
-    force_active_context = _is_truthy(os.getenv(FORCE_ACTIVE_BANK_CONTEXT_ENV, "false"))
+    force_active_context = _is_truthy(os.getenv(FORCE_ACTIVE_BANK_CONTEXT_ENV, "false")) or bool(
+        include_active_context
+    )
     if fetch_all_active or force_active_context:
-        symbols.extend(_load_active_banks_from_meta())
+        symbols.extend(_load_active_bank_symbols())
 
     extras = os.getenv("NEPSE_EXTRA_SYMBOLS", "")
     if extras:
@@ -197,11 +207,13 @@ def _resolve_symbols_to_fetch(target_symbol: str) -> list[str]:
 
 
 def _load_active_banks_from_meta() -> list[str]:
-    model_dir = Path(os.getenv("MODEL_DIR", "src/tft_artifacts"))
+    model_dir = Path(os.getenv("MODEL_DIR", "models"))
     candidate_files = [
+        model_dir / "autotft_meta.json",
         model_dir / "model_meta.json",
         model_dir / "tft_meta.json",
-        Path("src/tft_artifacts/tft_meta.json"),
+        Path("models/autotft_meta.json"),
+        Path("models/tft_meta.json"),
     ]
 
     for meta_path in candidate_files:
@@ -218,6 +230,19 @@ def _load_active_banks_from_meta() -> list[str]:
         return [str(bank).strip().upper() for bank in active_banks if str(bank).strip()]
 
     return []
+
+
+def _load_active_bank_symbols() -> list[str]:
+    symbols_from_meta = _load_active_banks_from_meta()
+    if symbols_from_meta:
+        return sorted(set(symbols_from_meta))
+
+    symbols: set[str] = set()
+    for row in list_commercial_bank_companies():
+        symbol = str(row.get("symbol", "")).strip().upper()
+        if symbol:
+            symbols.add(symbol)
+    return sorted(symbols)
 
 
 def _fetch_price_volume_history(

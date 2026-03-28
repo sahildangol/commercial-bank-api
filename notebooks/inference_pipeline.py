@@ -28,10 +28,24 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 POLICY_RATE_FALLBACK = 4.5
-DEFAULT_ARTIFACT_DIR = Path("src/tft_artifacts")
+DEFAULT_ARTIFACT_DIR = Path("models")
 DEFAULT_WEEKMASK = "Sun Mon Tue Wed Thu"
 DEFAULT_CAR = 12.0
 DEFAULT_NPL = 2.0
+DEFAULT_STATE_DICT_NAME = "tft_model.pth"
+DEFAULT_CKPT_NAME = "tft_best_model.ckpt"
+NOTEBOOK_TARGET = "t5"
+NOTEBOOK_KNOWN_REALS = ["time_idx"]
+NOTEBOOK_UNKNOWN_REALS = ["close_x", "volume_x", "t1", "t3", "t5"]
+NOTEBOOK_ENCODER_LENGTH = 30
+NOTEBOOK_PREDICTION_LENGTH = 5
+NOTEBOOK_MODEL_KWARGS = {
+    "learning_rate": 1e-3,
+    "hidden_size": 32,
+    "attention_head_size": 4,
+    "dropout": 0.2,
+    "hidden_continuous_size": 16,
+}
 HISTORY_WINDOW_DAYS = 5
 SUMMARY_HORIZON_DAYS = 5
 API_SIGNAL_COLUMNS = [
@@ -61,10 +75,14 @@ API_SIGNAL_COLUMNS = [
 try:
     import torch
     from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+    from pytorch_forecasting.data import GroupNormalizer
+    from pytorch_forecasting.metrics import MAE
 except ModuleNotFoundError as exc:  # pragma: no cover - handled at runtime
     torch = None
     TimeSeriesDataSet = None
     TemporalFusionTransformer = None
+    GroupNormalizer = None
+    MAE = None
     _IMPORT_ERROR: ModuleNotFoundError | None = exc
 else:  # pragma: no cover - simple assignment
     _IMPORT_ERROR = None
@@ -105,13 +123,24 @@ class NEPSEInferencePipeline:
         self.meta.setdefault("n_features", len(self.meta["model_features"]))
 
         self._model = None
+        self._state_dict: dict[str, Any] | None = None
         self._dataset_parameters: dict[str, Any] | None = None
-        self.target_name = "target_logret"
-        self.max_encoder_length = int(self.meta.get("encoder_len", 30))
-        self.max_prediction_length = int(self.meta.get("pred_len", 7))
-        self.known_reals = list(self.meta.get("known_reals", []))
-        self.unknown_reals = list(self.meta.get("unknown_reals", []))
-        self.supported_banks = [str(bank).strip().upper() for bank in self.meta.get("banks", [])]
+        self._uses_state_dict = self.checkpoint_path.suffix.lower() == ".pth"
+
+        default_target = NOTEBOOK_TARGET if self._uses_state_dict else "target_logret"
+        default_encoder = NOTEBOOK_ENCODER_LENGTH if self._uses_state_dict else 30
+        default_pred = NOTEBOOK_PREDICTION_LENGTH if self._uses_state_dict else 7
+        default_known = NOTEBOOK_KNOWN_REALS if self._uses_state_dict else []
+        default_unknown = NOTEBOOK_UNKNOWN_REALS if self._uses_state_dict else []
+
+        self.target_name = str(self.meta.get("target", default_target))
+        self.max_encoder_length = int(self.meta.get("encoder_len", default_encoder))
+        self.max_prediction_length = int(self.meta.get("pred_len", default_pred))
+        self.known_reals = list(self.meta.get("known_reals", default_known))
+        self.unknown_reals = list(self.meta.get("unknown_reals", default_unknown))
+
+        raw_banks = self.meta.get("banks") or self.meta.get("bank_classes") or self.meta.get("active_banks") or []
+        self.supported_banks = [str(bank).strip().upper() for bank in raw_banks if str(bank).strip()]
 
     def predict(
         self,
@@ -174,6 +203,7 @@ class NEPSEInferencePipeline:
         car_value, npl_value = self._resolve_fundamentals(bank, fundamentals)
         artifacts = self._forecast_single_bank(
             ohlcv_df=bank_history,
+            full_ohlcv_df=ohlcv,
             bank=bank,
             nepse_df=nepse,
             car=car_value,
@@ -289,13 +319,14 @@ class NEPSEInferencePipeline:
                 f"Supported banks: {', '.join(self.supported_banks)}"
             )
         ohlcv = self._prepare_ohlcv(ohlcv_df)
-        ohlcv = ohlcv[ohlcv["bank"] == bank].copy()
-        if ohlcv.empty:
+        bank_history = ohlcv[ohlcv["bank"] == bank].copy()
+        if bank_history.empty:
             raise ValueError(f"No OHLCV rows found for bank '{bank}'.")
 
         nepse, used_nepse_fallback = self._prepare_nepse(nepse_df, ohlcv)
         artifacts = self._forecast_single_bank(
-            ohlcv_df=ohlcv,
+            ohlcv_df=bank_history,
+            full_ohlcv_df=ohlcv,
             bank=bank,
             nepse_df=nepse,
             car=float(car),
@@ -329,7 +360,9 @@ class NEPSEInferencePipeline:
         if checkpoint_path is not None and Path(checkpoint_path) != self.checkpoint_path:
             self.checkpoint_path = Path(checkpoint_path)
             self._model = None
+            self._state_dict = None
             self._dataset_parameters = None
+            self._uses_state_dict = self.checkpoint_path.suffix.lower() == ".pth"
 
         ohlcv_df = pd.read_csv(csv_path)
         inferred_bank = bank or self._infer_bank_symbol(ohlcv_df, csv_path)
@@ -381,6 +414,7 @@ class NEPSEInferencePipeline:
     def _forecast_single_bank(
         self,
         ohlcv_df: pd.DataFrame,
+        full_ohlcv_df: pd.DataFrame,
         bank: str,
         nepse_df: pd.DataFrame,
         car: float,
@@ -391,28 +425,58 @@ class NEPSEInferencePipeline:
     ) -> ForecastArtifacts:
         self._load_model()
 
-        history = self._build_feature_history(
-            ohlcv_df=ohlcv_df,
-            bank=bank,
-            nepse_df=nepse_df,
-            car=car,
-            npl=npl,
-            policy_rate=policy_rate,
-        )
-        inference_frame = self._build_inference_frame(history, bank=bank, policy_rate=policy_rate)
-        dataset = TimeSeriesDataSet.from_parameters(
-            self._dataset_parameters,
-            inference_frame,
-            predict=True,
-            stop_randomization=True,
-        )
-        dataloader = dataset.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
+        if self._uses_state_dict:
+            history = self._build_notebook_feature_history(ohlcv_df=ohlcv_df, bank=bank)
+            inference_frame = self._build_inference_frame(history, bank=bank, policy_rate=policy_rate)
 
-        predictions = self._model.predict(
-            dataloader,
-            mode="prediction",
-            trainer_kwargs=self._trainer_kwargs(),
-        )
+            context_history = self._build_notebook_feature_history(ohlcv_df=full_ohlcv_df, bank=None)
+            context_history = context_history.groupby("bank", group_keys=False).filter(
+                lambda frame: len(frame) >= (self.max_encoder_length + self.max_prediction_length)
+            )
+            if context_history.empty or bank not in set(context_history["bank"].unique()):
+                context_history = history.copy()
+
+            training_dataset = self._build_state_dict_training_dataset(context_history)
+            prediction_dataset = TimeSeriesDataSet.from_dataset(
+                training_dataset,
+                inference_frame,
+                predict=True,
+                stop_randomization=True,
+            )
+            dataloader = prediction_dataset.to_dataloader(
+                train=False,
+                batch_size=batch_size,
+                num_workers=0,
+            )
+            self._ensure_state_dict_model(training_dataset)
+            predictions = self._model.predict(
+                dataloader,
+                mode="prediction",
+                trainer_kwargs=self._trainer_kwargs(),
+            )
+        else:
+            history = self._build_feature_history(
+                ohlcv_df=ohlcv_df,
+                bank=bank,
+                nepse_df=nepse_df,
+                car=car,
+                npl=npl,
+                policy_rate=policy_rate,
+            )
+            inference_frame = self._build_inference_frame(history, bank=bank, policy_rate=policy_rate)
+            dataset = TimeSeriesDataSet.from_parameters(
+                self._dataset_parameters,
+                inference_frame,
+                predict=True,
+                stop_randomization=True,
+            )
+            dataloader = dataset.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
+            predictions = self._model.predict(
+                dataloader,
+                mode="prediction",
+                trainer_kwargs=self._trainer_kwargs(),
+            )
+
         raw_vector = self._flatten_predictions(predictions, self.max_prediction_length)
         target_interpretation = self._infer_target_interpretation(raw_vector)
         forecast = self._build_forecast_dataframe(
@@ -445,6 +509,9 @@ class NEPSEInferencePipeline:
         npl: float,
         policy_rate: float,
     ) -> pd.DataFrame:
+        if self._uses_state_dict:
+            return self._build_notebook_feature_history(ohlcv_df=ohlcv_df, bank=bank)
+
         history = ohlcv_df.sort_values("date").copy()
         history["bank"] = bank
         history["group_id"] = bank
@@ -540,12 +607,139 @@ class NEPSEInferencePipeline:
 
         return history
 
+    def _build_notebook_feature_history(
+        self,
+        ohlcv_df: pd.DataFrame,
+        bank: str | None = None,
+    ) -> pd.DataFrame:
+        frame = ohlcv_df.copy()
+        if bank is not None:
+            target_bank = str(bank).strip().upper()
+            frame = frame[frame["bank"].astype(str).str.strip().str.upper() == target_bank]
+        if frame.empty:
+            raise ValueError(f"No OHLCV rows found for bank '{bank}'.")
+
+        frame = frame.sort_values(["bank", "date"]).copy()
+        frame["bank"] = frame["bank"].astype(str).str.strip().str.upper()
+        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+        frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce")
+        frame = frame.dropna(subset=["date", "bank", "close"])
+        if frame.empty:
+            raise ValueError("No valid OHLCV rows available after numeric coercion.")
+
+        groups: list[pd.DataFrame] = []
+        for bank_name, group in frame.groupby("bank", sort=False):
+            history = group.sort_values("date").copy()
+            history["close_x"] = history["close"].astype(float)
+            history["volume_x"] = history["volume"].fillna(0.0).astype(float)
+            history["t1"] = (history["close_x"].shift(-1) - history["close_x"]) / history["close_x"]
+            history["t3"] = (history["close_x"].shift(-3) - history["close_x"]) / history["close_x"]
+            history["t5"] = (history["close_x"].shift(-5) - history["close_x"]) / history["close_x"]
+            history[["t1", "t3", "t5"]] = (
+                history[["t1", "t3", "t5"]]
+                .replace([np.inf, -np.inf], np.nan)
+                .ffill()
+                .bfill()
+                .fillna(0.0)
+            )
+            history["time_idx"] = np.arange(len(history), dtype=np.int64)
+            groups.append(history)
+
+        combined = pd.concat(groups, ignore_index=True)
+        minimum_rows = self.max_encoder_length
+        if bank is not None and len(combined) < minimum_rows:
+            raise ValueError(
+                f"{bank} has only {len(combined)} usable rows after feature engineering. "
+                f"Need at least {minimum_rows} rows for encoder inference."
+            )
+        return combined.reset_index(drop=True)
+
+    def _build_state_dict_training_dataset(self, history: pd.DataFrame) -> Any:
+        return TimeSeriesDataSet(
+            history,
+            time_idx="time_idx",
+            target=self.target_name,
+            group_ids=["bank"],
+            max_encoder_length=self.max_encoder_length,
+            max_prediction_length=self.max_prediction_length,
+            time_varying_unknown_reals=[
+                column for column in NOTEBOOK_UNKNOWN_REALS if column in history.columns
+            ],
+            time_varying_known_reals=[
+                column for column in NOTEBOOK_KNOWN_REALS if column in history.columns
+            ],
+            target_normalizer=GroupNormalizer(groups=["bank"]),
+        )
+
+    def _ensure_state_dict_model(self, training_dataset: Any) -> None:
+        if self._model is not None:
+            return
+        if self._state_dict is None:
+            raise RuntimeError("State dict is not loaded for AutoTFT inference.")
+
+        model = TemporalFusionTransformer.from_dataset(
+            training_dataset,
+            **NOTEBOOK_MODEL_KWARGS,
+            loss=MAE(),
+        )
+        try:
+            missing, unexpected = model.load_state_dict(self._state_dict, strict=False)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Unable to load state dict model from {self.checkpoint_path}: {exc}"
+            ) from exc
+
+        if missing or unexpected:
+            self._log(
+                "Loaded state dict with non-critical differences: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+
+        model.to(self.device)
+        model.eval()
+        self._model = model
+
     def _build_inference_frame(
         self,
         history: pd.DataFrame,
         bank: str,
         policy_rate: float,
     ) -> pd.DataFrame:
+        if self._uses_state_dict:
+            future_dates = self._future_dates(
+                last_date=pd.Timestamp(history["date"].iloc[-1]),
+                steps=self.max_prediction_length,
+            )
+            future = pd.DataFrame({"date": future_dates})
+            last_row = history.iloc[-1]
+
+            future["bank"] = bank
+            future["open"] = float(last_row["close"])
+            future["high"] = float(last_row["close"])
+            future["low"] = float(last_row["close"])
+            future["close"] = float(last_row["close"])
+            future["volume"] = float(last_row["volume"])
+            future["close_x"] = float(last_row["close_x"])
+            future["volume_x"] = float(last_row["volume_x"])
+            future["t1"] = float(last_row["t1"])
+            future["t3"] = float(last_row["t3"])
+            future["t5"] = float(last_row["t5"])
+            future["time_idx"] = np.arange(
+                int(history["time_idx"].iloc[-1]) + 1,
+                int(history["time_idx"].iloc[-1]) + 1 + self.max_prediction_length,
+                dtype=np.int64,
+            )
+
+            inference_frame = pd.concat([history, future], ignore_index=True, sort=False)
+            required_columns = self._required_dataset_columns()
+            for column in required_columns:
+                if column not in inference_frame.columns:
+                    if column == "bank":
+                        inference_frame[column] = bank
+                    else:
+                        inference_frame[column] = 0.0
+            return inference_frame
+
         future_dates = self._future_dates(
             last_date=pd.Timestamp(history["date"].iloc[-1]),
             steps=self.max_prediction_length,
@@ -677,6 +871,8 @@ class NEPSEInferencePipeline:
 
     def _infer_target_interpretation(self, raw_predictions: np.ndarray) -> str:
         target_name = str(self.target_name).lower()
+        if target_name in {"t1", "t3", "t5"}:
+            return "simple_return"
         if "logret" in target_name and float(np.nanmin(raw_predictions)) < 0.0:
             return "log_return"
         if "logret" in target_name:
@@ -811,11 +1007,43 @@ class NEPSEInferencePipeline:
         return pd.date_range(start=last_date + offset, periods=steps, freq=offset)
 
     def _load_model(self) -> None:
-        if self._model is not None and self._dataset_parameters is not None:
+        if self._uses_state_dict and self._state_dict is not None:
+            return
+        if (not self._uses_state_dict) and self._model is not None and self._dataset_parameters is not None:
             return
 
         self._ensure_runtime_dependencies()
         self._log(f"Loading TFT checkpoint from {self.checkpoint_path}")
+
+        if self._uses_state_dict:
+            loaded = torch.load(
+                str(self.checkpoint_path),
+                map_location=self.device,
+                weights_only=False,
+            )
+            if isinstance(loaded, dict) and "state_dict" in loaded and isinstance(
+                loaded.get("state_dict"), dict
+            ):
+                loaded = loaded["state_dict"]
+            if not isinstance(loaded, dict):
+                raise RuntimeError(
+                    f"Expected a state_dict dictionary in {self.checkpoint_path}, got {type(loaded)}."
+                )
+            self._state_dict = loaded
+            self.target_name = NOTEBOOK_TARGET
+            self.max_encoder_length = NOTEBOOK_ENCODER_LENGTH
+            self.max_prediction_length = NOTEBOOK_PREDICTION_LENGTH
+            self.known_reals = list(NOTEBOOK_KNOWN_REALS)
+            self.unknown_reals = list(NOTEBOOK_UNKNOWN_REALS)
+            self.meta["best_checkpoint"] = str(self.checkpoint_path)
+            self.meta["target"] = self.target_name
+            self.meta["encoder_len"] = self.max_encoder_length
+            self.meta["pred_len"] = self.max_prediction_length
+            self.meta["known_reals"] = self.known_reals
+            self.meta["unknown_reals"] = self.unknown_reals
+            self.meta["model_features"] = self._combine_feature_columns(self.meta)
+            self.meta["n_features"] = len(self.meta["model_features"])
+            return
 
         loaded_with_cpu_fallback = False
         try:
@@ -938,7 +1166,13 @@ class NEPSEInferencePipeline:
         return []
 
     def _ensure_runtime_dependencies(self) -> None:
-        if _IMPORT_ERROR is not None:
+        if (
+            _IMPORT_ERROR is not None
+            or TimeSeriesDataSet is None
+            or TemporalFusionTransformer is None
+            or GroupNormalizer is None
+            or MAE is None
+        ):
             raise RuntimeError(
                 "PyTorch Forecasting runtime dependencies are missing. "
                 "Install torch, lightning, and pytorch-forecasting before running inference."
@@ -969,37 +1203,73 @@ class NEPSEInferencePipeline:
         return torch.device("cpu")
 
     def _resolve_checkpoint_path(self, checkpoint_path: str | None) -> Path:
+        configured_path = os.getenv("AUTOTFT_MODEL_PATH")
+        if configured_path:
+            return Path(configured_path).resolve()
         if checkpoint_path:
             return Path(checkpoint_path).resolve()
 
         search_roots = [self.artifact_dir, DEFAULT_ARTIFACT_DIR]
         for root in search_roots:
-            if root.exists():
-                matches = sorted(root.glob("*.ckpt"))
-                if matches:
-                    return matches[0].resolve()
+            if not root.exists():
+                continue
 
-        recursive_matches = sorted(Path.cwd().rglob("*.ckpt"))
-        if recursive_matches:
-            return recursive_matches[0].resolve()
+            preferred_state = root / DEFAULT_STATE_DICT_NAME
+            if preferred_state.exists():
+                return preferred_state.resolve()
 
-        raise FileNotFoundError("No TFT checkpoint (.ckpt) could be found in the project.")
+            preferred_ckpt = root / DEFAULT_CKPT_NAME
+            if preferred_ckpt.exists():
+                return preferred_ckpt.resolve()
+
+            state_matches = sorted(root.glob("*.pth"))
+            if state_matches:
+                return state_matches[0].resolve()
+
+            ckpt_matches = sorted(root.glob("*.ckpt"))
+            if ckpt_matches:
+                return ckpt_matches[0].resolve()
+
+        recursive_state = sorted(Path.cwd().rglob("*.pth"))
+        if recursive_state:
+            return recursive_state[0].resolve()
+
+        recursive_ckpt = sorted(Path.cwd().rglob("*.ckpt"))
+        if recursive_ckpt:
+            return recursive_ckpt[0].resolve()
+
+        raise FileNotFoundError("No TFT artifact (.pth or .ckpt) could be found in the project.")
 
     def _load_meta(self) -> dict[str, Any]:
         candidate_files = [
+            self.artifact_dir / "autotft_meta.json",
             self.artifact_dir / "tft_meta.json",
-            self.artifact_dir / "model_meta.json",
+            Path("models/autotft_meta.json"),
+            Path("models/tft_meta.json"),
             DEFAULT_ARTIFACT_DIR / "tft_meta.json",
-            DEFAULT_ARTIFACT_DIR / "model_meta.json",
         ]
         for candidate in candidate_files:
             if not candidate.exists():
                 continue
             try:
                 with candidate.open("r", encoding="utf-8") as handle:
-                    return json.load(handle)
+                    meta = json.load(handle)
             except json.JSONDecodeError:
                 continue
+            if isinstance(meta, dict):
+                return meta
+
+        if self.checkpoint_path.suffix.lower() == ".pth":
+            return {
+                "best_checkpoint": str(self.checkpoint_path),
+                "target": NOTEBOOK_TARGET,
+                "encoder_len": NOTEBOOK_ENCODER_LENGTH,
+                "pred_len": NOTEBOOK_PREDICTION_LENGTH,
+                "known_reals": list(NOTEBOOK_KNOWN_REALS),
+                "unknown_reals": list(NOTEBOOK_UNKNOWN_REALS),
+                "banks": [],
+                "metrics": {},
+            }
 
         return {
             "best_checkpoint": str(self.checkpoint_path),

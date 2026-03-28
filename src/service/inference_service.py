@@ -148,8 +148,8 @@ def get_ensemble_artifacts(model_path: str) -> EnsembleArtifacts:
 class InferenceService:
     def __init__(self, session: Session) -> None:
         self.session = session
-        self.autotft_model_dir = os.getenv("MODEL_DIR", "src/tft_artifacts")
-        self.ensemble_model_dir = os.getenv("ENSEMBLE_MODEL_DIR", "src/db/models")
+        self.autotft_model_dir = os.getenv("MODEL_DIR", "models")
+        self.ensemble_model_dir = os.getenv("ENSEMBLE_MODEL_DIR", "models")
         self.scraper_module = os.getenv("NEPSE_SCRAPER_MODULE", "src.scripts.nepse_scraper")
         self.scraper_function = os.getenv("NEPSE_SCRAPER_FUNCTION", "scrape_market_data")
         self.autotft_model_type = os.getenv("AUTOTFT_MODEL_TYPE", os.getenv("MODEL_TYPE", "autotft"))
@@ -157,6 +157,10 @@ class InferenceService:
             "AUTOTFT_MODEL_TARGET",
             os.getenv("MODEL_TARGET", "multi_horizon"),
         )
+        self.autotft_include_active_context = os.getenv(
+            "AUTOTFT_INCLUDE_ACTIVE_CONTEXT",
+            "false",
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self.ensemble_model_type = os.getenv("ENSEMBLE_MODEL_TYPE", "ensemble")
         self.ensemble_model_target = os.getenv("ENSEMBLE_MODEL_TARGET", "single_step")
         self.pipeline_verbose = os.getenv("INFERENCE_PIPELINE_VERBOSE", "false").strip().lower() in {
@@ -185,7 +189,10 @@ class InferenceService:
             model_version_id=model_version.id,
             prediction_date=prediction_date,
         )
-        scraped = self._run_scraper(payload)
+        scraped = self._run_scraper(
+            payload,
+            include_active_context=self.autotft_include_active_context,
+        )
         ohlcv_df, nepse_df = self._build_frames(scraped)
         fundamentals = self._build_fundamentals(
             payload.fundamentals,
@@ -482,7 +489,11 @@ class InferenceService:
         self.session.refresh(prediction)
         return PredictionRecordResponse.model_validate(prediction)
 
-    def _run_scraper(self, payload: InferenceRequest) -> dict[str, Any]:
+    def _run_scraper(
+        self,
+        payload: InferenceRequest,
+        include_active_context: bool = False,
+    ) -> dict[str, Any]:
         symbol = payload.symbol.strip().upper()
 
         try:
@@ -511,9 +522,17 @@ class InferenceService:
                 symbol=symbol,
                 timeframe=payload.timeframe,
                 lookback_days=payload.lookback_days,
+                include_active_context=include_active_context,
             )
         except TypeError:
-            result = scraper(symbol, payload.timeframe, payload.lookback_days)
+            try:
+                result = scraper(
+                    symbol=symbol,
+                    timeframe=payload.timeframe,
+                    lookback_days=payload.lookback_days,
+                )
+            except TypeError:
+                result = scraper(symbol, payload.timeframe, payload.lookback_days)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Scraper failed: {exc}") from exc
 
@@ -610,7 +629,7 @@ class InferenceService:
     def _load_ensemble_artifacts(self) -> EnsembleArtifacts:
         model_path = self._resolve_ensemble_path(
             env_var="ENSEMBLE_MODEL_PATH",
-            defaults=["nepse_model.pkl", "src/db/models/nepse_model.pkl"],
+            defaults=["nepse_model.pkl"],
         )
         try:
             return get_ensemble_artifacts(model_path=model_path)
